@@ -110,41 +110,10 @@ static std::vector<const char*> g_sigPtrsV1;
 static std::vector<const char*> g_sigPtrsV10;
 static bool g_sigsLoaded = false;
 
-static void ensureSignaturesLoaded() {
-    if (g_sigsLoaded) return;
-    g_sigsLoaded = true;
 
-    ConfigDocument doc = loadConfigDocument();
+// 自验证标志（Hook 回调写入，tryHookGroup 读取）
+static volatile bool g_hookValid = false;
 
-    auto load = [&](const char* key, 
-                    const std::vector<const char*>& defaults,
-                    std::vector<std::string>& strings,
-                    std::vector<const char*>& ptrs) {
-        strings.clear();
-        ptrs.clear();
-
-        auto arr = doc.canonical.find(key);
-        if (arr != doc.canonical.end() && arr->is_array() && !arr->empty()) {
-            for (auto& s : *arr) {
-                if (s.is_string()) strings.push_back(s.get<std::string>());
-            }
-            LOGI("Loaded %zu signatures from config for %s", strings.size(), key);
-        }
-
-        // 兜底：用默认签名
-        if (strings.empty()) {
-            for (auto* def : defaults) {
-                strings.push_back(def);
-            }
-            LOGI("Using %zu built-in signatures for %s", strings.size(), key);
-        }
-
-        for (auto& s : strings) ptrs.push_back(s.c_str());
-    };
-
-    load("signatures_v1",  SIG_V1_DEFAULT,  g_sigStringsV1,  g_sigPtrsV1);
-    load("signatures_v10", SIG_V10_DEFAULT, g_sigStringsV10, g_sigPtrsV10);
-}
 
 // ------------------------------------------------------------
 // 智能模块定位
@@ -446,6 +415,42 @@ if (stat(tmpStr.c_str(), &st) != 0) {
     return true;
 }
 
+static void ensureSignaturesLoaded() {
+    if (g_sigsLoaded) return;
+    g_sigsLoaded = true;
+
+    ConfigDocument doc = loadConfigDocument();
+
+    auto load = [&](const char* key, 
+                    const std::vector<const char*>& defaults,
+                    std::vector<std::string>& strings,
+                    std::vector<const char*>& ptrs) {
+        strings.clear();
+        ptrs.clear();
+
+        auto arr = doc.canonical.find(key);
+        if (arr != doc.canonical.end() && arr->is_array() && !arr->empty()) {
+            for (auto& s : *arr) {
+                if (s.is_string()) strings.push_back(s.get<std::string>());
+            }
+            LOGI("Loaded %zu signatures from config for %s", strings.size(), key);
+        }
+
+        // 兜底：用默认签名
+        if (strings.empty()) {
+            for (auto* def : defaults) {
+                strings.push_back(def);
+            }
+            LOGI("Using %zu built-in signatures for %s", strings.size(), key);
+        }
+
+        for (auto& s : strings) ptrs.push_back(s.c_str());
+    };
+
+    load("signatures_v1",  SIG_V1_DEFAULT,  g_sigStringsV1,  g_sigPtrsV1);
+    load("signatures_v10", SIG_V10_DEFAULT, g_sigStringsV10, g_sigPtrsV10);
+}
+
 // ------------------------------------------------------------
 // applyConfig（带 Sanity Check）
 // ------------------------------------------------------------
@@ -556,6 +561,8 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
         }
     }
 }
+
+static void generateHelpFile();  // 前置声明
 
 
 static void ensureConfigExists() {
@@ -702,10 +709,10 @@ static bool tryInstallHook(const ModuleInfo& mod) {
 ensureSignaturesLoaded();
     LOGI("Starting signature scan (module: 0x%lx, %zu bytes)...", mod.base, mod.size);
     // ★ 保持原始优先级：先 V1，再 V10
-    if (tryHookGroup(mod, SIG_V1, (void*)detour_v1, &orig_v1, "V1"))
-        return true;
-    if (tryHookGroup(mod, SIG_V10, (void*)detour_v10, &orig_v10, "V10"))
-        return true;
+    if (tryHookGroup(mod, g_sigPtrsV1, (void*)detour_v1, &orig_v1, "V1"))
+    return true;
+if (tryHookGroup(mod, g_sigPtrsV10, (void*)detour_v10, &orig_v10, "V10"))
+    return true;
     LOGI("All signatures exhausted, no valid hook found.");
     return false;
 }

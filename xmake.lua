@@ -1,0 +1,13 @@
+add_rules("mode.release")
+add_requires("nlohmann_json v3.11.3")
+add_requires("dobby")
+
+target("ForceCloseOreUI")
+    set_kind("shared")
+    add_files("src/**.cpp")
+    add_includedirs("src")
+    set_languages("c++20")
+    set_strip("all")
+    add_packages("nlohmann_json", "dobby")
+    add_syslinks("log")
+    add_cxflags("-O3")

@@ -474,70 +474,51 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
     bool dirty = doc.dirty || (access(doc.target.string().c_str(), F_OK) != 0);
     if (!doc.canonical.is_object()) { doc.canonical = Json::object(); dirty = true; }
 
-    // --- 读取 mod.enabled ---
-    bool mod_enabled = true;
-    if (doc.canonical.contains("mod") && doc.canonical["mod"].is_object()) {
-        auto& mod = doc.canonical["mod"];
-        if (mod.contains("enabled")) {
-            if (auto p = readBoolLike(mod["enabled"])) mod_enabled = *p;
+    // --- 读取 mod_enabled（顶层）---
+bool mod_enabled = true;
+auto me = doc.canonical.find("mod_enabled");
+if (me != doc.canonical.end()) {
+    if (auto p = readBoolLike(*me)) mod_enabled = *p;
+}
+
+// --- 读取 safe_mode（顶层）---
+bool safe_mode = false;
+auto sm = doc.canonical.find("safe_mode");
+if (sm != doc.canonical.end()) {
+    if (auto p = readBoolLike(*sm)) safe_mode = *p;
+}
+
+// --- 读取 _native 分组 ---
+Json* native = nullptr;
+auto nv = doc.canonical.find("_native");
+if (nv != doc.canonical.end() && nv->is_object()) {
+    native = &(*nv);
+}
+
+// --- 遍历 OreUI 条目 ---
+for (auto& [name, config] : ore_ui.mConfigs) {
+    bool value = false;
+
+    if (!safe_mode && native) {
+        // 正常模式：从 _native.mod 里读
+        auto& mod_block = (*native)["mod"];
+        if (mod_block.contains(name)) {
+            if (auto p = readBoolLike(mod_block[name])) value = *p;
+        }
+    } else if (safe_mode && native) {
+        // 安全模式：从 _native.safe 里读
+        auto& safe_block = (*native)["safe"];
+        if (safe_block.contains(name)) {
+            if (auto p = readBoolLike(safe_block[name])) value = *p;
         }
     }
+    // 安全模式下不读任何值 = 全部 false（禁用）
 
-    if (!mod_enabled) {
-        LOGI("[%s] mod.enabled = false. Mod disabled, nothing to do.", label);
-        return;
-    }
-
-    // --- 读取 safe.mode ---
-    bool safe_mode = false;
-    if (doc.canonical.contains("safe") && doc.canonical["safe"].is_object()) {
-        auto& sf = doc.canonical["safe"];
-        if (sf.contains("mode")) {
-            if (auto p = readBoolLike(sf["mode"])) safe_mode = *p;
-        }
-    }
-
-    if (safe_mode) {
-        LOGI("[%s] safe.mode = true. Forcing ALL OreUI off.", label);
-    }
-
-    // --- 确保 block 存在 ---
-    if (!doc.canonical.contains("mod") || !doc.canonical["mod"].is_object()) {
-        doc.canonical["mod"] = Json::object();
+    // 新条目补到 _native.mod
+    if (native && !(*native)["mod"].contains(name)) {
+        (*native)["mod"][name] = value;
         dirty = true;
     }
-    if (!doc.canonical.contains("safe") || !doc.canonical["safe"].is_object()) {
-        doc.canonical["safe"] = Json::object();
-        dirty = true;
-    }
-
-    auto& mod_block  = doc.canonical["mod"];
-    auto& safe_block = doc.canonical["safe"];
-
-    // --- 遍历 OreUI 条目 ---
-    for (auto& [name, config] : ore_ui.mConfigs) {
-        LOGI("[%s] -> %s", label, name.c_str());
-
-        bool value = false;
-
-        if (safe_mode) {
-            // 安全模式：只看 safe block
-            if (safe_block.contains(name)) {
-                if (auto p = readBoolLike(safe_block[name])) value = *p;
-            }
-            // value 默认 false = 全部禁用
-        } else {
-            // 正常模式：先看 mod block
-            if (mod_block.contains(name)) {
-                if (auto p = readBoolLike(mod_block[name])) value = *p;
-            }
-        }
-
-        // 新条目自动补到 mod block
-        if (!mod_block.contains(name)) {
-            mod_block[name] = value;
-            dirty = true;
-        }
 
         if (!value) {
             config.mUnknown3 = []() { return false; };
@@ -548,9 +529,13 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
         }
     }
 
-    // --- 确保必要字段存在 ---
-    if (!mod_block.contains("enabled"))  { mod_block["enabled"] = true;  dirty = true; }
-    if (!safe_block.contains("mode"))    { safe_block["mode"] = false;   dirty = true; }
+// 确保顶层字段存在
+if (doc.canonical.find("mod_enabled") == doc.canonical.end()) {
+    doc.canonical["mod_enabled"] = true;  dirty = true;
+}
+if (doc.canonical.find("safe_mode") == doc.canonical.end()) {
+    doc.canonical["safe_mode"] = false;   dirty = true;
+}
 
     if (dirty) {
         if (saveConfigDocument(doc.target, doc.canonical)) {

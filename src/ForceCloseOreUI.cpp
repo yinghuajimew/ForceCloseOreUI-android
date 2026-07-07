@@ -78,10 +78,8 @@ public:
 // V10: 新版本，11 参数，OreUi 在第 10 个
 // ------------------------------------------------------------
 
-
-
-// 内置默认签名（硬编码兜底）
-static const std::vector<const char*> SIG_V1_DEFAULT = {
+// ★ 硬编码保留作为兜底
+static const std::vector<const char*> SIG_FALLBACK = {
     //1.26.30
     "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 F7 03 05 AA FB 03 03 2A",
     // H8 - 1.26.20 最新
@@ -98,22 +96,44 @@ static const std::vector<const char*> SIG_V1_DEFAULT = {
     "? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 ? ? ? D5 FB 03 00 AA F5 03 07 AA",
 };
 
-static const std::vector<const char*> SIG_V10_DEFAULT = {
-//1.26.30
-    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 F7 03 05 AA FB 03 03 2A",
-};
+static std::vector<std::string> g_loadedSignatures;
 
-// 运行时签名（优先从 config.json 读取，失败用默认）
-static std::vector<std::string> g_sigStringsV1;
-static std::vector<std::string> g_sigStringsV10;
-static std::vector<const char*> g_sigPtrsV1;
-static std::vector<const char*> g_sigPtrsV10;
-static bool g_sigsLoaded = false;
+static std::vector<std::string>& loadSignatures() {
+    if (!g_loadedSignatures.empty()) return g_loadedSignatures;
+
+    std::string sigPath = getConfigDir() + "signatures.json";
+
+    // 尝试读取 signatures.json
+    try {
+        if (access(sigPath.c_str(), F_OK) == 0) {
+            std::ifstream input(sigPath);
+            Json json = Json::parse(input, nullptr, false, true);
+            if (!json.is_discarded() && json.contains("signatures") && json["signatures"].is_array()) {
+                for (auto& s : json["signatures"]) {
+                    if (s.is_string()) g_loadedSignatures.push_back(s.get<std::string>());
+                }
+                if (!g_loadedSignatures.empty()) {
+                    LOGI("Loaded %zu signatures from %s", g_loadedSignatures.size(), sigPath.c_str());
+                    return g_loadedSignatures;
+                }
+            }
+        }
+    } catch (...) {}
+
+    // 兜底：用硬编码
+    LOGI("Using built-in fallback signatures.");
+    for (auto s : SIG_FALLBACK) g_loadedSignatures.push_back(s);
+    return g_loadedSignatures;
+}
 
 
+
+
+
+// ------------------------------------------------------------
 // 自验证标志（Hook 回调写入，tryHookGroup 读取）
+// ------------------------------------------------------------
 static volatile bool g_hookValid = false;
-
 
 // ------------------------------------------------------------
 // 智能模块定位
@@ -415,55 +435,17 @@ if (stat(tmpStr.c_str(), &st) != 0) {
     return true;
 }
 
-static void ensureSignaturesLoaded() {
-    if (g_sigsLoaded) return;
-    g_sigsLoaded = true;
-
-    ConfigDocument doc = loadConfigDocument();
-
-    auto load = [&](const char* key, 
-                    const std::vector<const char*>& defaults,
-                    std::vector<std::string>& strings,
-                    std::vector<const char*>& ptrs) {
-        strings.clear();
-        ptrs.clear();
-
-        auto arr = doc.canonical.find(key);
-        if (arr != doc.canonical.end() && arr->is_array() && !arr->empty()) {
-            for (auto& s : *arr) {
-                if (s.is_string()) strings.push_back(s.get<std::string>());
-            }
-            LOGI("Loaded %zu signatures from config for %s", strings.size(), key);
-        }
-
-        // 兜底：用默认签名
-        if (strings.empty()) {
-            for (auto* def : defaults) {
-                strings.push_back(def);
-            }
-            LOGI("Using %zu built-in signatures for %s", strings.size(), key);
-        }
-
-        for (auto& s : strings) ptrs.push_back(s.c_str());
-    };
-
-    load("signatures_v1",  SIG_V1_DEFAULT,  g_sigStringsV1,  g_sigPtrsV1);
-    load("signatures_v10", SIG_V10_DEFAULT, g_sigStringsV10, g_sigPtrsV10);
-}
-
 // ------------------------------------------------------------
 // applyConfig（带 Sanity Check）
 // ------------------------------------------------------------
 static void applyConfig(OreUi& ore_ui, const char* label) {
-    LOGI("[%s] applyConfig called! mConfigs.size()=%zu", label, ore_ui.mConfigs.size());
-
     size_t map_size = ore_ui.mConfigs.size();
     if (map_size == 0) {
         LOGI("[%s] mConfigs empty (size 0). Skipping.", label);
         return;
     }
     if (map_size > 2000) {
-        LOGE("[%s] Sanity FAILED! mConfigs size = %zu", label, map_size);
+        LOGE("[%s] Sanity FAILED! mConfigs size = %zu (garbage).", label, map_size);
         return;
     }
 
@@ -471,54 +453,52 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
     LOGI("[%s] Valid! Found %zu OreUI configs.", label, map_size);
 
     ConfigDocument doc = loadConfigDocument();
-    bool dirty = doc.dirty || (access(doc.target.string().c_str(), F_OK) != 0);
-    if (!doc.canonical.is_object()) { doc.canonical = Json::object(); dirty = true; }
+    if (!doc.canonical.is_object()) { doc.canonical = Json::object(); }
 
-    // --- 读取 mod_enabled（顶层）---
-bool mod_enabled = true;
-auto me = doc.canonical.find("mod_enabled");
-if (me != doc.canonical.end()) {
-    if (auto p = readBoolLike(*me)) mod_enabled = *p;
-}
+    // ★ 扁平分段解析
+    enum Section { NONE, MODE, SAFE };
+    Section current = NONE;
+    bool mode_enabled = false;
+    bool safe_enabled = false;
+    std::unordered_map<std::string, bool> mode_entries;
+    std::unordered_map<std::string, bool> safe_entries;
 
-// --- 读取 safe_mode（顶层）---
-bool safe_mode = false;
-auto sm = doc.canonical.find("safe_mode");
-if (sm != doc.canonical.end()) {
-    if (auto p = readBoolLike(*sm)) safe_mode = *p;
-}
-
-// --- 读取 _native 分组 ---
-Json* native = nullptr;
-auto nv = doc.canonical.find("_native");
-if (nv != doc.canonical.end() && nv->is_object()) {
-    native = &(*nv);
-}
-
-// --- 遍历 OreUI 条目 ---
-for (auto& [name, config] : ore_ui.mConfigs) {
-    bool value = false;
-
-    if (!safe_mode && native) {
-        // 正常模式：从 _native.mod 里读
-        auto& mod_block = (*native)["mod"];
-        if (mod_block.contains(name)) {
-            if (auto p = readBoolLike(mod_block[name])) value = *p;
+    for (auto& [key, value] : doc.canonical.items()) {
+        if (key == "mode") {
+            if (auto parsed = readBoolLike(value)) mode_enabled = *parsed;
+            current = MODE;
+            continue;
         }
-    } else if (safe_mode && native) {
-        // 安全模式：从 _native.safe 里读
-        auto& safe_block = (*native)["safe"];
-        if (safe_block.contains(name)) {
-            if (auto p = readBoolLike(safe_block[name])) value = *p;
+        if (key == "safe_mode") {
+            if (auto parsed = readBoolLike(value)) safe_enabled = *parsed;
+            current = SAFE;
+            continue;
+        }
+        // 普通条目，属于当前区域
+        if (auto parsed = readBoolLike(value)) {
+            if (current == MODE) {
+                mode_entries[key] = *parsed;
+            } else if (current == SAFE) {
+                safe_entries[key] = *parsed;
+            }
         }
     }
-    // 安全模式下不读任何值 = 全部 false（禁用）
 
-    // 新条目补到 _native.mod
-    if (native && !(*native)["mod"].contains(name)) {
-        (*native)["mod"][name] = value;
-        dirty = true;
-    }
+    LOGI("[%s] mode=%s safe_mode=%s", label,
+         mode_enabled ? "ON" : "OFF",
+         safe_enabled ? "ON" : "OFF");
+
+    for (auto& [name, config] : ore_ui.mConfigs) {
+        LOGI("[%s] -> %s", label, name.c_str());
+
+        bool value = false; // 默认关闭
+
+        // 优先级：mode 条目 > safe_mode 条目
+        if (mode_enabled && mode_entries.count(name)) {
+            value = mode_entries[name];
+        } else if (safe_enabled && safe_entries.count(name)) {
+            value = safe_entries[name];
+        }
 
         if (!value) {
             config.mUnknown3 = []() { return false; };
@@ -528,98 +508,69 @@ for (auto& [name, config] : ore_ui.mConfigs) {
             LOGI("[%s]   -> Kept OreUI: %s", label, name.c_str());
         }
     }
-
-// 确保顶层字段存在
-if (doc.canonical.find("mod_enabled") == doc.canonical.end()) {
-    doc.canonical["mod_enabled"] = true;  dirty = true;
 }
-if (doc.canonical.find("safe_mode") == doc.canonical.end()) {
-    doc.canonical["safe_mode"] = false;   dirty = true;
-}
-
-    if (dirty) {
-        if (saveConfigDocument(doc.target, doc.canonical)) {
-            LOGI("[%s] Config saved (enabled=%s, safe=%s)",
-                 label, mod_enabled ? "true" : "false", safe_mode ? "true" : "false");
-        } else {
-            LOGE("Config applied but could not be saved.");
-        }
-    }
-}
-
-static void generateHelpFile();  // 前置声明
 
 
 static void ensureConfigExists() {
-    std::string configPath = getConfigDir() + "config.json";
-    
+    std::string configPath  = getConfigDir() + "config.json";
+    std::string sigPath     = getConfigDir() + "signatures.json";
+    std::string readmePath  = getConfigDir() + "readme.txt";
     struct stat st;
+
+    // --- config.json ---
+    bool configValid = false;
     if (stat(configPath.c_str(), &st) == 0 && st.st_size > 0) {
-        LOGI("Config exists (%ld bytes)", (long)st.st_size);
-        return;
-    }
-    
-    Json defaults = Json::object();
-    defaults["mod"] = Json::object();
-    defaults["mod"]["enabled"] = true;
-    defaults["safe"] = Json::object();
-    defaults["safe"]["mode"] = false;
-    defaults["signatures_v1"] = Json::array();
-    defaults["signatures_v10"] = Json::array();
-    
-    bool ok = saveConfigDocument(fs::path(configPath), defaults);
-    
-    if (!ok) {
-        LOGE("External storage write FAILED. Trying internal storage fallback...");
-        
-        // 兜底：写入内部存储
-        std::string internalPath = "/data/data/" + packageName + "/files/ForceCloseOreUI_config.json";
-        mkdir(("/data/data/" + packageName + "/files").c_str(), 0755);
-        
-        FILE* fp = fopen(internalPath.c_str(), "wb");
-        if (fp) {
-            std::string payload = defaults.dump(4);
-            fwrite(payload.data(), 1, payload.size(), fp);
-            fclose(fp);
-            LOGI("Fallback config created at: %s", internalPath.c_str());
-        } else {
-            LOGE("CRITICAL: Both external and internal storage failed!");
+        // 校验结构：必须有 mode 和 safe_mode
+        try {
+            std::ifstream input(configPath);
+            Json json = Json::parse(input, nullptr, false, true);
+            if (!json.is_discarded() && json.contains("mode") && json.contains("safe_mode")) {
+                LOGI("config.json valid.");
+                configValid = true;
+            } else {
+                LOGE("config.json missing mode/safe_mode, recreating...");
+            }
+        } catch (...) {
+            LOGE("config.json corrupted, recreating...");
         }
     }
-    
-    // 最终验证（复用前面的 st 变量，不需要再声明）
-    if (stat(configPath.c_str(), &st) == 0) {  // ← 这里直接用，不要再写 struct stat st;
-        LOGI("Verified: config exists on disk (%ld bytes)", (long)st.st_size);
-    } else {
-        LOGE("Config creation FAILED on this device!");
-    }
-    // 生成帮助文件
-    generateHelpFile();
-}
 
-static void generateHelpFile() {
-    std::string helpPath = getConfigDir() + "config_help.txt";
-    
-    struct stat st;
-    if (stat(helpPath.c_str(), &st) == 0) return;  // 已存在就不覆盖
-    
-    FILE* fp = fopen(helpPath.c_str(), "w");
-    if (!fp) return;
-    
-    fprintf(fp,
-        "ForceCloseOreUI 配置文件说明\n"
-        "==============================\n\n"
-        "[mod]\n"
-        "  enabled = true/false  -- 模组总开关。false = 完全不工作\n"
-        "  /play, /settings 等   -- 各界面开关。false = 旧版UI, true = OreUI\n\n"
-        "[safe]\n"
-        "  mode = true/false     -- 安全模式。true = 强制关闭所有 OreUI\n"
-        "  (安全模式下忽略 [mod] 里的各条目值)\n\n"
-        "[signatures_v1]  旧版 ARM64 特征码（留空用内置默认）\n"
-        "[signatures_v10] 新版 ARM64 特征码（留空用内置默认）\n"
-    );
-    
-    fclose(fp);
+    if (!configValid) {
+        Json defaults = Json::object();
+        defaults["mode"] = true;
+        defaults["safe_mode"] = true;
+        saveConfigDocument(fs::path(configPath), defaults);
+        LOGI("config.json created.");
+    }
+
+    // --- signatures.json ---
+    if (stat(sigPath.c_str(), &st) != 0 || st.st_size == 0) {
+        Json sigJson;
+        sigJson["signatures"] = Json::array();
+        for (auto s : SIG_FALLBACK) sigJson["signatures"].push_back(s);
+        saveConfigDocument(fs::path(sigPath), sigJson);
+        LOGI("signatures.json created.");
+    }
+
+    // --- readme.txt ---
+    if (stat(readmePath.c_str(), &st) != 0) {
+        FILE* fp = fopen(readmePath.c_str(), "w");
+        if (fp) {
+            fprintf(fp,
+                "=== ForceCloseOreUI ===\n\n"
+                "config.json 结构 (扁平分段):\n"
+                "  \"mode\": true/false   ← mode 区域开关，下面的条目归 mode 管\n"
+                "  \"/play\": true/false  ← mode 区域条目\n"
+                "  \"safe_mode\": true/false ← safe_mode 区域开关，下面归 safe_mode 管\n"
+                "  \"/settings\": false   ← safe_mode 区域条目\n\n"
+                "优先级: mode 条目 > safe_mode 条目\n"
+                "相同条目名冲突时 mode 胜出\n\n"
+                "signatures.json: ARM64 特征码池，可手动加新版本\n"
+            );
+            fclose(fp);
+        }
+        LOGI("readme.txt created.");
+    }
 }
 
 // ------------------------------------------------------------
@@ -691,14 +642,21 @@ static bool tryHookGroup(const ModuleInfo& mod, const std::vector<const char*>& 
 }
 
 static bool tryInstallHook(const ModuleInfo& mod) {
-ensureSignaturesLoaded();
-    LOGI("Starting signature scan (module: 0x%lx, %zu bytes)...", mod.base, mod.size);
-    // ★ 保持原始优先级：先 V1，再 V10
-    if (tryHookGroup(mod, g_sigPtrsV1, (void*)detour_v1, &orig_v1, "V1"))
-    return true;
-if (tryHookGroup(mod, g_sigPtrsV10, (void*)detour_v10, &orig_v10, "V10"))
-    return true;
-    LOGI("All signatures exhausted, no valid hook found.");
+    auto& sigs = loadSignatures();
+    if (sigs.empty()) return false;
+
+    std::vector<const char*> sigPtrs;
+    for (auto& s : sigs) sigPtrs.push_back(s.c_str());
+
+    LOGI("Starting signature scan (%zu sigs)...", sigs.size());
+
+    // 同一个签名池，先用 V1 detour（6参数）试，再用 V10 detour（11参数）试
+    if (tryHookGroup(mod, sigPtrs, (void*)detour_v1, &orig_v1, "V1"))
+        return true;
+    if (tryHookGroup(mod, sigPtrs, (void*)detour_v10, &orig_v10, "V10"))
+        return true;
+
+    LOGI("All signatures exhausted with both detours.");
     return false;
 }
 

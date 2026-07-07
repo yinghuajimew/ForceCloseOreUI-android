@@ -544,6 +544,7 @@ if (dirty) {
         LOGE("Config applied in memory but could not be saved.");
     }
 }
+}
 
 
 static void ensureConfigExists() {

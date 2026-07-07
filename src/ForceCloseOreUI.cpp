@@ -445,7 +445,7 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
         return;
     }
     if (map_size > 2000) {
-        LOGE("[%s] Sanity FAILED! mConfigs size = %zu (garbage).", label, map_size);
+        LOGE("[%s] Sanity FAILED! mConfigs size = %zu.", label, map_size);
         return;
     }
 
@@ -459,7 +459,6 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
     enum Section { NONE, MODE, SAFE };
     Section current = NONE;
     bool mode_enabled = false;
-    bool safe_enabled = false;
     std::unordered_map<std::string, bool> mode_entries;
     std::unordered_map<std::string, bool> safe_entries;
 
@@ -470,34 +469,40 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
             continue;
         }
         if (key == "safe_mode") {
-            if (auto parsed = readBoolLike(value)) safe_enabled = *parsed;
             current = SAFE;
             continue;
         }
-        // 普通条目，属于当前区域
+        // 普通条目，归当前区域
         if (auto parsed = readBoolLike(value)) {
-            if (current == MODE) {
-                mode_entries[key] = *parsed;
-            } else if (current == SAFE) {
-                safe_entries[key] = *parsed;
-            }
+            if (current == MODE)       mode_entries[key] = *parsed;
+            else if (current == SAFE)  safe_entries[key] = *parsed;
         }
     }
 
-    LOGI("[%s] mode=%s safe_mode=%s", label,
-         mode_enabled ? "ON" : "OFF",
-         safe_enabled ? "ON" : "OFF");
+    // ★ safe_mode 条目永远生效，不需要全局开关
+    LOGI("[%s] mode=%s", label, mode_enabled ? "ON" : "OFF");
+
+    std::vector<std::string> keysOrder; // 保持 JSON 顺序
+    bool dirty = false;
 
     for (auto& [name, config] : ore_ui.mConfigs) {
+        keysOrder.push_back(name);
         LOGI("[%s] -> %s", label, name.c_str());
 
-        bool value = false; // 默认关闭
+        bool value = false;
 
-        // 优先级：mode 条目 > safe_mode 条目
+        // 优先级：mode 条目（且 mode=true） > safe_mode 条目（永远生效）
         if (mode_enabled && mode_entries.count(name)) {
             value = mode_entries[name];
-        } else if (safe_enabled && safe_entries.count(name)) {
-            value = safe_entries[name];
+        } else if (safe_entries.count(name)) {
+            value = safe_entries[name];  // ★ safe_mode 条目不受全局开关影响
+        }
+
+        // ★ 回写：确保 config.json 里每个 OreUI 条目都存在
+        if (!doc.canonical.contains(name)) {
+            // 新条目，根据所在区域决定写到哪里
+            doc.canonical[name] = value;
+            dirty = true;
         }
 
         if (!value) {
@@ -508,6 +513,36 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
             LOGI("[%s]   -> Kept OreUI: %s", label, name.c_str());
         }
     }
+
+// 确保 mode 和 safe_mode 标记存在
+if (!doc.canonical.contains("mode")) { doc.canonical["mode"] = true; dirty = true; }
+if (!doc.canonical.contains("safe_mode")) { doc.canonical["safe_mode"] = false; dirty = true; }
+
+if (dirty) {
+    // ★ 重建 JSON，保证顺序：mode → mode条目 → safe_mode → safe条目
+    Json ordered = Json::object();
+    ordered["mode"] = mode_enabled;
+
+    // mode 区域条目
+    for (auto& [name, config] : ore_ui.mConfigs) {
+        if (safe_entries.count(name)) continue;  // safe 条目后面再写
+        ordered[name] = mode_entries.count(name) ? mode_entries[name] : false;
+    }
+
+    // safe_mode 标记
+    ordered["safe_mode"] = false;  // 只是分段标记，不是开关
+
+    // safe_mode 区域条目
+    for (auto& [name, config] : ore_ui.mConfigs) {
+        if (!safe_entries.count(name)) continue;
+        ordered[name] = safe_entries[name];
+    }
+
+    if (saveConfigDocument(doc.target, ordered)) {
+        LOGI("[%s] Config saved with correct ordering.", label);
+    } else {
+        LOGE("Config applied in memory but could not be saved.");
+    }
 }
 
 
@@ -517,39 +552,22 @@ static void ensureConfigExists() {
     std::string readmePath  = getConfigDir() + "readme.txt";
     struct stat st;
 
-    // --- config.json ---
-    bool configValid = false;
-    if (stat(configPath.c_str(), &st) == 0 && st.st_size > 0) {
-        // 校验结构：必须有 mode 和 safe_mode
-        try {
-            std::ifstream input(configPath);
-            Json json = Json::parse(input, nullptr, false, true);
-            if (!json.is_discarded() && json.contains("mode") && json.contains("safe_mode")) {
-                LOGI("config.json valid.");
-                configValid = true;
-            } else {
-                LOGE("config.json missing mode/safe_mode, recreating...");
-            }
-        } catch (...) {
-            LOGE("config.json corrupted, recreating...");
-        }
-    }
-
-    if (!configValid) {
+    // --- config.json（最小结构，条目录由 applyConfig 补全） ---
+    if (stat(configPath.c_str(), &st) != 0 || st.st_size == 0) {
         Json defaults = Json::object();
         defaults["mode"] = true;
-        defaults["safe_mode"] = true;
+        defaults["safe_mode"] = false;  // ★ 只是一个分段标记，不是全局开关
         saveConfigDocument(fs::path(configPath), defaults);
-        LOGI("config.json created.");
+        LOGI("config.json created (entries will be filled on first hook).");
     }
 
-    // --- signatures.json ---
+    // --- signatures.json（写入内置签名） ---
     if (stat(sigPath.c_str(), &st) != 0 || st.st_size == 0) {
         Json sigJson;
         sigJson["signatures"] = Json::array();
         for (auto s : SIG_FALLBACK) sigJson["signatures"].push_back(s);
         saveConfigDocument(fs::path(sigPath), sigJson);
-        LOGI("signatures.json created.");
+        LOGI("signatures.json created with %zu built-in signatures.", SIG_FALLBACK.size());
     }
 
     // --- readme.txt ---
@@ -557,15 +575,22 @@ static void ensureConfigExists() {
         FILE* fp = fopen(readmePath.c_str(), "w");
         if (fp) {
             fprintf(fp,
-                "=== ForceCloseOreUI ===\n\n"
-                "config.json 结构 (扁平分段):\n"
-                "  \"mode\": true/false   ← mode 区域开关，下面的条目归 mode 管\n"
-                "  \"/play\": true/false  ← mode 区域条目\n"
-                "  \"safe_mode\": true/false ← safe_mode 区域开关，下面归 safe_mode 管\n"
-                "  \"/settings\": false   ← safe_mode 区域条目\n\n"
-                "优先级: mode 条目 > safe_mode 条目\n"
-                "相同条目名冲突时 mode 胜出\n\n"
-                "signatures.json: ARM64 特征码池，可手动加新版本\n"
+                "=== ForceCloseOreUI 配置文件说明 ===\n\n"
+                "【 config.json 】\n"
+                "  分段式结构，按\"区域标记行\"分割：\n\n"
+                "  \"mode\": true          ← 正常模式区域开关\n"
+                "    /play: true          ← 游戏界面：保留 OreUI\n"
+                "    /settings: false     ← 设置界面：关闭 OreUI（用旧版UI）\n\n"
+                "  \"safe_mode\": false    ← 强制模式区域标记（不是全局开关！）\n"
+                "    /achievement: false  ← 成就界面：强制关闭 OreUI\n\n"
+                "  ★ mode 和 safe_mode 都只是分段标记，不控制其他条目\n"
+                "  ★ safe_mode 下的条目一定会生效（强制模式）\n"
+                "  ★ mode 下的条目：mode 为 true 时生效\n"
+                "  ★ 两个区域都没有的条目：默认关闭 OreUI\n"
+                "  ★ 同一个条目同时出现在两个区域：mode 优先\n\n"
+                "【 signatures.json 】\n"
+                "  ARM64 内存特征码，新版 Minecraft 需要加新特征码时在这里添加\n"
+                "  SO 内置了兜底签名，删掉此文件会自动重新生成\n"
             );
             fclose(fp);
         }

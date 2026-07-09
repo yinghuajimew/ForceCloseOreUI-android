@@ -96,6 +96,7 @@ static const std::vector<const char*> SIG_FALLBACK = {
     "? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 ? ? ? D5 FB 03 00 AA F5 03 07 AA",
 };
 
+static std::string g_loadedDetourType = "";
 static std::vector<std::string> g_loadedSignatures;
 
 static std::vector<std::string>& loadSignatures() {
@@ -103,7 +104,6 @@ static std::vector<std::string>& loadSignatures() {
 
     std::string sigPath = getConfigDir() + "signatures.json";
 
-    // 尝试读取 signatures.json
     try {
         if (access(sigPath.c_str(), F_OK) == 0) {
             std::ifstream input(sigPath);
@@ -112,17 +112,22 @@ static std::vector<std::string>& loadSignatures() {
                 for (auto& s : json["signatures"]) {
                     if (s.is_string()) g_loadedSignatures.push_back(s.get<std::string>());
                 }
+                // 读取 detour 类型
+                if (json.contains("detour") && json["detour"].is_string()) {
+                    g_loadedDetourType = json["detour"].get<std::string>();
+                }
                 if (!g_loadedSignatures.empty()) {
-                    LOGI("Loaded %zu signatures from %s", g_loadedSignatures.size(), sigPath.c_str());
+                    LOGI("Loaded %zu signatures from %s (detour=%s)", 
+                         g_loadedSignatures.size(), sigPath.c_str(), g_loadedDetourType.c_str());
                     return g_loadedSignatures;
                 }
             }
         }
     } catch (...) {}
 
-    // 兜底：用硬编码
     LOGI("Using built-in fallback signatures.");
     for (auto s : SIG_FALLBACK) g_loadedSignatures.push_back(s);
+    g_loadedDetourType = "";
     return g_loadedSignatures;
 }
 
@@ -148,17 +153,27 @@ static bool findMinecraftSegment(ModuleInfo& out) {
     if (!fp) return false;
 
     char line[1024];
+    uintptr_t min_base = UINTPTR_MAX;
+    uintptr_t max_end = 0;
+    bool found_so = false;
+
     while (fgets(line, sizeof(line), fp)) {
         if (!strstr(line, "r-x")) continue;
-        if (!strstr(line, "libminecraftpe.so")) continue;
-
-        uintptr_t start, end;
-        if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
-            out.base = start;
-            out.size = end - start;
-            fclose(fp);
-            return true;
+        if (strstr(line, "libminecraftpe.so")) {
+            uintptr_t start, end;
+            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                if (start < min_base) min_base = start;
+                if (end > max_end) max_end = end;
+                found_so = true;
+            }
         }
+    }
+
+    if (found_so) {
+        out.base = min_base;
+        out.size = max_end - min_base;
+        fclose(fp);
+        return true;
     }
 
     // 兜底：extractNativeLibs="false" 时 SO 映射为 base.apk
@@ -435,17 +450,17 @@ if (stat(tmpStr.c_str(), &st) != 0) {
     return true;
 }
 
-static void writeMatchedSignature(const std::string& sig) {
+static void writeMatchedSignature(const std::string& sig, const std::string& detourType) {
     std::string sigPath = getConfigDir() + "signatures.json";
     struct stat st;
-    // 已经存在且有内容就不覆盖（只写第一次）
     if (stat(sigPath.c_str(), &st) == 0 && st.st_size > 0) return;
 
     Json sigJson;
     sigJson["signatures"] = Json::array();
     sigJson["signatures"].push_back(sig);
+    sigJson["detour"] = detourType; // 存入 detour 类型
     saveConfigDocument(fs::path(sigPath), sigJson);
-    LOGI("Matched signature saved to signatures.json.");
+    LOGI("Matched signature saved to signatures.json with detour %s.", detourType.c_str());
 }
 
 // ------------------------------------------------------------
@@ -694,10 +709,17 @@ static bool tryInstallHook(const ModuleInfo& mod) {
     auto& sigs = loadSignatures();
     if (sigs.empty()) return false;
 
+    // 检查是否是从本地 json 成功读取的已保存特征码
+    bool isTrusted = false;
+    std::string sigPath = getConfigDir() + "signatures.json";
+    if (access(sigPath.c_str(), F_OK) == 0 && !g_loadedDetourType.empty()) {
+        isTrusted = true;
+    }
+
     std::vector<const char*> sigPtrs;
     for (auto& s : sigs) sigPtrs.push_back(s.c_str());
 
-    LOGI("Starting signature scan (%zu sigs)...", sigs.size());
+    LOGI("Starting signature scan (%zu sigs, trusted=%s)...", sigs.size(), isTrusted ? "YES" : "NO");
 
     for (size_t i = 0; i < sigPtrs.size(); i++) {
         uintptr_t addr = ResolveSignature(mod, sigPtrs[i]);
@@ -705,12 +727,30 @@ static bool tryInstallHook(const ModuleInfo& mod) {
 
         LOGI("Sig[%zu] matched at 0x%lx", i, addr);
 
+        // 如果是已验证的特征码，直接根据记录的 Detour 挂钩，无需再等待验证
+        if (isTrusted) {
+            if (g_loadedDetourType == "V1") {
+                if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
+                    LOGI("Sig[%zu] → V1 Hooked (Trusted, skip validation)", i);
+                    return true;
+                }
+            } else if (g_loadedDetourType == "V10") {
+                if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
+                    LOGI("Sig[%zu] → V10 Hooked (Trusted, skip validation)", i);
+                    return true;
+                }
+            }
+            continue;
+        }
+
+        // --- 以下为 fallback 特征码匹配时的原验证逻辑 ---
+        
         // V1
         g_hookValid = false;
         if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
             for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
             if (g_hookValid) {
-                writeMatchedSignature(std::string(sigPtrs[i]));
+                writeMatchedSignature(std::string(sigPtrs[i]), "V1");
                 LOGI("Sig[%zu] → V1 VALID!", i);
                 return true;
             }
@@ -722,13 +762,13 @@ static bool tryInstallHook(const ModuleInfo& mod) {
         if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
             for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
             if (g_hookValid) {
-                writeMatchedSignature(std::string(sigPtrs[i]));
+                writeMatchedSignature(std::string(sigPtrs[i]), "V10");
                 LOGI("Sig[%zu] → V10 VALID!", i);
                 return true;
             }
             DobbyDestroy((void*)addr); orig_v10 = nullptr;
         }
-    }  // ← for 循环在这里结束
+    }
 
     LOGI("All signatures exhausted with both detours.");
     return false;

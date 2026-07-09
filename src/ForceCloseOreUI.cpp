@@ -699,28 +699,36 @@ static bool tryInstallHook(const ModuleInfo& mod) {
 
     LOGI("Starting signature scan (%zu sigs)...", sigs.size());
 
-    // 同一个签名池，先用 V1 detour（6参数）试，再用 V10 detour（11参数）试
-    g_hookValid = false;
-if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
-    for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
-    if (g_hookValid) {
-        writeMatchedSignature(std::string(sigPtrs[i])); // ← 加这行
-        LOGI("Sig[%zu] → V1 VALID!", i);
-        return true;
-    }
-    DobbyDestroy((void*)addr); orig_v1 = nullptr;
-}
+    for (size_t i = 0; i < sigPtrs.size(); i++) {
+        uintptr_t addr = ResolveSignature(mod, sigPtrs[i]);
+        if (addr == 0) continue;
 
-g_hookValid = false;
-if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
-    for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
-    if (g_hookValid) {
-        writeMatchedSignature(std::string(sigPtrs[i])); // ← 加这行
-        LOGI("Sig[%zu] → V10 VALID!", i);
-        return true;
-    }
-    DobbyDestroy((void*)addr); orig_v10 = nullptr;
-}
+        LOGI("Sig[%zu] matched at 0x%lx", i, addr);
+
+        // V1
+        g_hookValid = false;
+        if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
+            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            if (g_hookValid) {
+                writeMatchedSignature(std::string(sigPtrs[i]));
+                LOGI("Sig[%zu] → V1 VALID!", i);
+                return true;
+            }
+            DobbyDestroy((void*)addr); orig_v1 = nullptr;
+        }
+
+        // V10
+        g_hookValid = false;
+        if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
+            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            if (g_hookValid) {
+                writeMatchedSignature(std::string(sigPtrs[i]));
+                LOGI("Sig[%zu] → V10 VALID!", i);
+                return true;
+            }
+            DobbyDestroy((void*)addr); orig_v10 = nullptr;
+        }
+    }  // ← for 循环在这里结束
 
     LOGI("All signatures exhausted with both detours.");
     return false;

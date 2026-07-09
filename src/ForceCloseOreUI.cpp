@@ -20,7 +20,7 @@
 #include <fcntl.h>
 
 namespace fs = std::filesystem;
-using Json = nlohmann::json;
+using Json = nlohmann::ordered_json;
 
 static std::string packageName;
 static std::string getPackageName();
@@ -519,29 +519,48 @@ if (!doc.canonical.contains("mode")) { doc.canonical["mode"] = true; dirty = tru
 if (!doc.canonical.contains("safe_mode")) { doc.canonical["safe_mode"] = false; dirty = true; }
 
 if (dirty) {
-    // ★ 重建 JSON，保证顺序：mode → mode条目 → safe_mode → safe条目
-    Json ordered = Json::object();
-    ordered["mode"] = mode_enabled;
+    // 手动拼 flat-sectioned JSON，完美还原主人的格式
+    std::string out = "{\n";
 
-    // mode 区域条目
-    for (auto& [name, config] : ore_ui.mConfigs) {
-        if (safe_entries.count(name)) continue;  // safe 条目后面再写
-        ordered[name] = mode_entries.count(name) ? mode_entries[name] : false;
+    // ── mode 行 ──────────────────────────────────
+    out += "  \"mode\": ";
+    out += mode_enabled ? "true" : "false";
+
+    // mode 区段条目（不是纯 safe 条目的都写在这里）
+    for (auto& [name, _] : ore_ui.mConfigs) {
+        bool inSafeOnly = safe_entries.count(name) && !mode_entries.count(name);
+        if (inSafeOnly) continue;
+        bool val = mode_entries.count(name) ? mode_entries.at(name) : false;
+        out += ",\n    \"" + name + "\": ";
+        out += val ? "true" : "false";
     }
 
-    // safe_mode 标记
-    ordered["safe_mode"] = false;  // 只是分段标记，不是开关
+    // ── safe_mode 行 ─────────────────────────────
+    out += ",\n  \"safe_mode\": false";
 
-    // safe_mode 区域条目
-    for (auto& [name, config] : ore_ui.mConfigs) {
+    // safe 区段条目（允许和 mode 区重复，如 /play）
+    for (auto& [name, _] : ore_ui.mConfigs) {
         if (!safe_entries.count(name)) continue;
-        ordered[name] = safe_entries[name];
+        bool val = safe_entries.at(name);
+        out += ",\n    \"" + name + "\": ";
+        out += val ? "true" : "false";
     }
 
-    if (saveConfigDocument(doc.target, ordered)) {
-        LOGI("[%s] Config saved with correct ordering.", label);
+    out += "\n}\n";
+
+    // 复用现有 atomic write 逻辑
+    std::string pathStr = doc.target.string();
+    std::string tmpStr  = pathStr + ".tmp";
+    FILE* fp = fopen(tmpStr.c_str(), "wb");
+    if (fp) {
+        fwrite(out.data(), 1, out.size(), fp);
+        fclose(fp);
+        if (rename(tmpStr.c_str(), pathStr.c_str()) == 0)
+            LOGI("[%s] Config saved (sectioned format, %zu bytes).", label, out.size());
+        else
+            LOGE("[%s] rename failed: %s", label, strerror(errno));
     } else {
-        LOGE("Config applied in memory but could not be saved.");
+        LOGE("[%s] fopen tmp failed: %s", label, strerror(errno));
     }
 }
 }

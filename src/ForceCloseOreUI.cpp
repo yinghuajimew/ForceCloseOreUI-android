@@ -435,6 +435,19 @@ if (stat(tmpStr.c_str(), &st) != 0) {
     return true;
 }
 
+static void writeMatchedSignature(const std::string& sig) {
+    std::string sigPath = getConfigDir() + "signatures.json";
+    struct stat st;
+    // 已经存在且有内容就不覆盖（只写第一次）
+    if (stat(sigPath.c_str(), &st) == 0 && st.st_size > 0) return;
+
+    Json sigJson;
+    sigJson["signatures"] = Json::array();
+    sigJson["signatures"].push_back(sig);
+    saveConfigDocument(fs::path(sigPath), sigJson);
+    LOGI("Matched signature saved to signatures.json.");
+}
+
 // ------------------------------------------------------------
 // applyConfig（带 Sanity Check）
 // ------------------------------------------------------------
@@ -581,15 +594,6 @@ static void ensureConfigExists() {
         LOGI("config.json created (entries will be filled on first hook).");
     }
 
-    // --- signatures.json（写入内置签名） ---
-    if (stat(sigPath.c_str(), &st) != 0 || st.st_size == 0) {
-        Json sigJson;
-        sigJson["signatures"] = Json::array();
-        for (auto s : SIG_FALLBACK) sigJson["signatures"].push_back(s);
-        saveConfigDocument(fs::path(sigPath), sigJson);
-        LOGI("signatures.json created with %zu built-in signatures.", SIG_FALLBACK.size());
-    }
-
     // --- readme.txt ---
     if (stat(readmePath.c_str(), &st) != 0) {
         FILE* fp = fopen(readmePath.c_str(), "w");
@@ -696,10 +700,27 @@ static bool tryInstallHook(const ModuleInfo& mod) {
     LOGI("Starting signature scan (%zu sigs)...", sigs.size());
 
     // 同一个签名池，先用 V1 detour（6参数）试，再用 V10 detour（11参数）试
-    if (tryHookGroup(mod, sigPtrs, (void*)detour_v1, &orig_v1, "V1"))
+    g_hookValid = false;
+if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
+    for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+    if (g_hookValid) {
+        writeMatchedSignature(std::string(sigPtrs[i])); // ← 加这行
+        LOGI("Sig[%zu] → V1 VALID!", i);
         return true;
-    if (tryHookGroup(mod, sigPtrs, (void*)detour_v10, &orig_v10, "V10"))
+    }
+    DobbyDestroy((void*)addr); orig_v1 = nullptr;
+}
+
+g_hookValid = false;
+if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
+    for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+    if (g_hookValid) {
+        writeMatchedSignature(std::string(sigPtrs[i])); // ← 加这行
+        LOGI("Sig[%zu] → V10 VALID!", i);
         return true;
+    }
+    DobbyDestroy((void*)addr); orig_v10 = nullptr;
+}
 
     LOGI("All signatures exhausted with both detours.");
     return false;

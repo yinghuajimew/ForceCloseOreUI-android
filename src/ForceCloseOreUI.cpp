@@ -79,28 +79,22 @@ public:
 // ------------------------------------------------------------
 
 // ★ 硬编码保留作为兜底
-// 1. 定义带有类型标记的特征码结构
-struct FallbackSig {
-    const char* sig;
-    const char* type; // "V1" 或 "V10"
-};
-
-// 2. 替换原有的 SIG_FALLBACK 数组
-static const std::vector<FallbackSig> SIG_FALLBACK = {
-    // ★ 1.26.40+ 新版本 V10 (我们刚刚定位出来的那个)
-    {"? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 5B D0 3B D5 F4 03 03 2A E3 03 02 AA 68 17 40 F9 E2 03 01 AA ? ? ? D1 A4 0C 80 52 F3 03 00 AA A8 83 1F F8 03 85 FF 97", "V10"},
-    
-    // ★ 1.26.40+ 新版本 V1 (QuickJS 引擎相关)
-    {"? ? ? D1 ? ? ? A9 F9 13 00 F9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 F7 03 05 AA F8 03 04 2A E4 03 01 AA E5 03 02 AA E6 03 1F 2A F3 03 02 AA F4 03 01 AA F5 03 00 AA 00 C0 92 95 F6 03 01 AA F9 03 00 AA", "V1"},
-    
-    // 下面是以前版本的旧特征码，我也帮你标记好了对应的类型
-    {"? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 F7 03 05 AA FB 03 03 2A", "V10"},
-    {"? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 FB 03 03 2A F8 03 02 2A", "V10"},
-    {"? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 ? ? ? D5 FB 03 00 AA F5 03 07 AA", "V10"},
-    {"? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? F9 ? ? ? D5 FB 03 00 AA ? ? ? F9 F5 03 07 AA", "V10"},
-    {"? ? ? D1 ? ? ? A9 ? ? ? 91 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 E8 03 03 AA", "V10"},
-    {"? ? ? D1 ? ? ? 91 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 E8 03 03 AA", "V10"},
-    {"? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 ? ? ? D5 FB 03 00 AA F5 03 07 AA", "V10"}
+static const std::vector<const char*> SIG_FALLBACK = {
+"? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 5B D0 3B D5 F6 03 07 AA F7 03 06 AA 68 17 40 F9 F9 03 05 2A FA 03 02 AA F5 03 04 AA F4 03 03 AA F8 03 01 AA A8 83 1F F8",
+    //1.26.30
+    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 F7 03 05 AA FB 03 03 2A",
+    // H8 - 1.26.20 最新
+    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 FB 03 03 2A F8 03 02 2A",
+    // H4 - 1.21.130 ~ 1.26.0
+    "? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 ? ? ? D5 FB 03 00 AA F5 03 07 AA",
+    // H5 - 1.26.0 ~ 1.26.10
+    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? F9 ? ? ? D5 FB 03 00 AA ? ? ? F9 F5 03 07 AA",
+    // ★ 补H2 - 1.21.90 ~ 1.21.120
+    "? ? ? D1 ? ? ? A9 ? ? ? 91 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 E8 03 03 AA",
+    // ★ 补H3 - 1.21.120
+    "? ? ? D1 ? ? ? 91 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 E8 03 03 AA",
+    // ★ 补H7 - 1.26.10
+    "? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 ? ? ? D5 FB 03 00 AA F5 03 07 AA",
 };
 
 static std::string g_loadedDetourType = "";
@@ -119,6 +113,7 @@ static std::vector<std::string>& loadSignatures() {
                 for (auto& s : json["signatures"]) {
                     if (s.is_string()) g_loadedSignatures.push_back(s.get<std::string>());
                 }
+                // 读取 detour 类型
                 if (json.contains("detour") && json["detour"].is_string()) {
                     g_loadedDetourType = json["detour"].get<std::string>();
                 }
@@ -132,8 +127,7 @@ static std::vector<std::string>& loadSignatures() {
     } catch (...) {}
 
     LOGI("Using built-in fallback signatures.");
-    // ★ 关键修改点：从 .sig 成员中读取字符串
-    for (const auto& s : SIG_FALLBACK) g_loadedSignatures.push_back(s.sig);
+    for (auto s : SIG_FALLBACK) g_loadedSignatures.push_back(s);
     g_loadedDetourType = "";
     return g_loadedSignatures;
 }
@@ -716,6 +710,7 @@ static bool tryInstallHook(const ModuleInfo& mod) {
     auto& sigs = loadSignatures();
     if (sigs.empty()) return false;
 
+    // 检查是否是从本地 json 成功读取的已保存特征码
     bool isTrusted = false;
     std::string sigPath = getConfigDir() + "signatures.json";
     if (access(sigPath.c_str(), F_OK) == 0 && !g_loadedDetourType.empty()) {
@@ -733,6 +728,7 @@ static bool tryInstallHook(const ModuleInfo& mod) {
 
         LOGI("Sig[%zu] matched at 0x%lx", i, addr);
 
+        // 如果是已验证的特征码，直接根据记录的 Detour 挂钩，无需再等待验证
         if (isTrusted) {
             if (g_loadedDetourType == "V1") {
                 if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
@@ -748,39 +744,34 @@ static bool tryInstallHook(const ModuleInfo& mod) {
             continue;
         }
 
-        // --- 动态扫描 Fallback 的逻辑进行修正 ---
-        // 获取当前特征码预设的正确类型
-        std::string expectedType = "V10"; // 默认兜底
-        if (i < SIG_FALLBACK.size()) {
-            expectedType = SIG_FALLBACK[i].type;
+        // --- 以下为 fallback 特征码匹配时的原验证逻辑 ---
+        
+        // V1
+        g_hookValid = false;
+        if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
+            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            if (g_hookValid) {
+                writeMatchedSignature(std::string(sigPtrs[i]), "V1");
+                LOGI("Sig[%zu] → V1 VALID!", i);
+                return true;
+            }
+            DobbyDestroy((void*)addr); orig_v1 = nullptr;
         }
 
-        if (expectedType == "V1") {
-            g_hookValid = false;
-            if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
-                for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
-                if (g_hookValid) {
-                    writeMatchedSignature(std::string(sigPtrs[i]), "V1");
-                    LOGI("Sig[%zu] -> V1 VALID!", i);
-                    return true;
-                }
-                DobbyDestroy((void*)addr); orig_v1 = nullptr;
+        // V10
+        g_hookValid = false;
+        if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
+            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            if (g_hookValid) {
+                writeMatchedSignature(std::string(sigPtrs[i]), "V10");
+                LOGI("Sig[%zu] → V10 VALID!", i);
+                return true;
             }
-        } else if (expectedType == "V10") {
-            g_hookValid = false;
-            if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
-                for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
-                if (g_hookValid) {
-                    writeMatchedSignature(std::string(sigPtrs[i]), "V10");
-                    LOGI("Sig[%zu] -> V10 VALID!", i);
-                    return true;
-                }
-                DobbyDestroy((void*)addr); orig_v10 = nullptr;
-            }
+            DobbyDestroy((void*)addr); orig_v10 = nullptr;
         }
     }
 
-    LOGI("All signatures exhausted.");
+    LOGI("All signatures exhausted with both detours.");
     return false;
 }
 

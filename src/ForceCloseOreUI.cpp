@@ -79,8 +79,13 @@ public:
 // ------------------------------------------------------------
 
 // ★ 硬编码保留作为兜底
-static const std::vector<const char*> SIG_FALLBACK = {
-//=== 新版 Minecraft V10 (11个参数) 候选特征码 ===
+// ------------------------------------------------------------
+// 分离版的 Signatures
+// ------------------------------------------------------------
+
+// 1. 新版本 (11 参数 V10) 专属特征码
+static const std::vector<const char*> SIG_V10 = {
+    // 把你用 Python 提取的 11 参数 (V10) 的 3 个特征码放在这里：
     // [1] sub_AFB75A0 | 得分: 155
     "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 5A D0 3B D5 F4 03 07 AA F6 03 06 AA 48 17 40 F9 F8 03 05 AA F9 03 04 AA F5 03 02 AA F7 03 01 AA",
 
@@ -89,18 +94,11 @@ static const std::vector<const char*> SIG_FALLBACK = {
 
     // [3] sub_A7F5F3C | 得分: 150
     "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 5B D0 3B D5 F6 03 07 AA F7 03 06 AA 68 17 40 F9 F9 03 05 2A FA 03 02 AA F5 03 04 AA",
+};
 
-
-//=== 旧版 Minecraft V1 (6个参数) 候选特征码 ===
-    // [1] sub_67D8768 | 得分: 170
-    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 F5 03 00 AA F9 03 01 AA E0 03 18 AA E1 03 02 AA F3 03 05 2A F4 03 04 AA F7 03 02 AA F6 03 03 AA",
-
-    // [2] sub_6E7BD9C | 得分: 170
-    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 F8 03 00 AA E0 03 02 AA F3 03 05 2A F4 03 04 2A F5 03 03 2A F6 03 02 AA F7 03 01 AA C8 D1 C9 95 ? ? ? A9",
-
-    // [3] sub_6E7BF28 | 得分: 170
-    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 F8 03 00 AA E0 03 01 AA F3 03 05 2A F4 03 04 AA F5 03 03 2A F6 03 02 2A F7 03 01 AA 65 D1 C9 95 ? ? ? A9",
-    //1.26.30
+// 2. 旧版本 (6 参数 V1) 兜底特征码
+static const std::vector<const char*> SIG_V1 = {
+    // 1.26.30
     "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 F7 03 05 AA FB 03 03 2A",
     // H8 - 1.26.20 最新
     "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 FB 03 03 2A F8 03 02 2A",
@@ -116,39 +114,77 @@ static const std::vector<const char*> SIG_FALLBACK = {
     "? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 ? ? ? D5 FB 03 00 AA F5 03 07 AA",
 };
 
-static std::string g_loadedDetourType = "";
-static std::vector<std::string> g_loadedSignatures;
+// ------------------------------------------------------------
+// 自验证标志（Hook 回调写入）
+// ------------------------------------------------------------
+static volatile bool g_hookValid = false;
 
-static std::vector<std::string>& loadSignatures() {
-    if (!g_loadedSignatures.empty()) return g_loadedSignatures;
-
+// ------------------------------------------------------------
+// 重写的 tryInstallHook (不再混合试错，严格分类)
+// ------------------------------------------------------------
+static bool tryInstallHook(const ModuleInfo& mod) {
+    // 1. 检查是否有以前保存过的成功特征码 (加速启动)
     std::string sigPath = getConfigDir() + "signatures.json";
-
-    try {
-        if (access(sigPath.c_str(), F_OK) == 0) {
+    if (access(sigPath.c_str(), F_OK) == 0) {
+        try {
             std::ifstream input(sigPath);
             Json json = Json::parse(input, nullptr, false, true);
-            if (!json.is_discarded() && json.contains("signatures") && json["signatures"].is_array()) {
-                for (auto& s : json["signatures"]) {
-                    if (s.is_string()) g_loadedSignatures.push_back(s.get<std::string>());
-                }
-                // 读取 detour 类型
-                if (json.contains("detour") && json["detour"].is_string()) {
-                    g_loadedDetourType = json["detour"].get<std::string>();
-                }
-                if (!g_loadedSignatures.empty()) {
-                    LOGI("Loaded %zu signatures from %s (detour=%s)", 
-                         g_loadedSignatures.size(), sigPath.c_str(), g_loadedDetourType.c_str());
-                    return g_loadedSignatures;
+            if (json.contains("signatures") && json.contains("detour") && json["detour"].is_string()) {
+                std::string detourType = json["detour"].get<std::string>();
+                std::string sig = json["signatures"][0].get<std::string>();
+                uintptr_t addr = ResolveSignature(mod, sig.c_str());
+                if (addr != 0) {
+                    if (detourType == "V10" && DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) return true;
+                    if (detourType == "V1"  && DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) return true;
                 }
             }
-        }
-    } catch (...) {}
+        } catch (...) {}
+    }
 
-    LOGI("Using built-in fallback signatures.");
-    for (auto s : SIG_FALLBACK) g_loadedSignatures.push_back(s);
-    g_loadedDetourType = "";
-    return g_loadedSignatures;
+    // 2. 开始全新扫描 - 先测新版 V10 (11参数)
+    LOGI("Starting signature scan (V10 / 11 parameters)...");
+    for (size_t i = 0; i < SIG_V10.size(); i++) {
+        uintptr_t addr = ResolveSignature(mod, SIG_V10[i]);
+        if (addr == 0) continue;
+
+        LOGI("V10 Sig[%zu] matched at 0x%lx", i, addr);
+        g_hookValid = false;
+        
+        // ★ 核心修复：V10 特征码只允许使用 V10 的 Hook 进行自验证！
+        if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
+            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            if (g_hookValid) {
+                writeMatchedSignature(std::string(SIG_V10[i]), "V10");
+                LOGI("V10 Sig[%zu] VALID!", i);
+                return true;
+            }
+            DobbyDestroy((void*)addr); orig_v10 = nullptr;
+        }
+    }
+
+    // 3. 如果新版没找到，再测旧版 V1 (6参数)
+    LOGI("Starting signature scan (V1 / 6 parameters)...");
+    for (size_t i = 0; i < SIG_V1.size(); i++) {
+        uintptr_t addr = ResolveSignature(mod, SIG_V1[i]);
+        if (addr == 0) continue;
+
+        LOGI("V1 Sig[%zu] matched at 0x%lx", i, addr);
+        g_hookValid = false;
+        
+        // ★ V1 特征码只允许使用 V1 的 Hook
+        if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
+            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            if (g_hookValid) {
+                writeMatchedSignature(std::string(SIG_V1[i]), "V1");
+                LOGI("V1 Sig[%zu] VALID!", i);
+                return true;
+            }
+            DobbyDestroy((void*)addr); orig_v1 = nullptr;
+        }
+    }
+
+    LOGI("All signatures exhausted.");
+    return false;
 }
 
 

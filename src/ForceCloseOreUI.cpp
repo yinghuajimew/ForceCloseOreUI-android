@@ -508,16 +508,20 @@ static bool tryInstallHook(const ModuleInfo& mod) {
         uintptr_t addr = ResolveSignature(mod, SIG_V10[i]);
         if (addr == 0) continue;
 
-        LOGI("V10 Sig[%zu] matched at 0x%lx", i, addr);
+        LOGI("V10 Sig[%zu] matched at 0x%lx. Hooking and waiting 60s for UI to init...", i, addr);
         g_hookValid = false;
         
         if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
-            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            // ★ 核心改动：把 2秒 等待变成了 60秒 (600次 x 0.1秒)
+            // 不用担心，一旦你进入主界面，它立刻就会完成并跳出循环
+            for (int w = 0; w < 600 && !g_hookValid; w++) usleep(100'000);
+            
             if (g_hookValid) {
                 writeMatchedSignature(std::string(SIG_V10[i]), "V10");
                 LOGI("V10 Sig[%zu] VALID!", i);
                 return true;
             }
+            LOGI("V10 Sig[%zu] TIMED OUT (not called). Unhooking...", i);
             DobbyDestroy((void*)addr); orig_v10 = nullptr;
         }
     }
@@ -527,16 +531,18 @@ static bool tryInstallHook(const ModuleInfo& mod) {
         uintptr_t addr = ResolveSignature(mod, SIG_V1[i]);
         if (addr == 0) continue;
 
-        LOGI("V1 Sig[%zu] matched at 0x%lx", i, addr);
+        LOGI("V1 Sig[%zu] matched at 0x%lx. Hooking and waiting 60s for UI to init...", i, addr);
         g_hookValid = false;
         
         if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
-            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            for (int w = 0; w < 600 && !g_hookValid; w++) usleep(100'000);
+            
             if (g_hookValid) {
                 writeMatchedSignature(std::string(SIG_V1[i]), "V1");
                 LOGI("V1 Sig[%zu] VALID!", i);
                 return true;
             }
+            LOGI("V1 Sig[%zu] TIMED OUT (not called). Unhooking...", i);
             DobbyDestroy((void*)addr); orig_v1 = nullptr;
         }
     }

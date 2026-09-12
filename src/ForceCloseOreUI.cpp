@@ -103,6 +103,8 @@ static std::string g_loadedDetourType = "";
 static std::vector<std::string> g_loadedSignatures;
 // ★ 新增：运行时获取真实页面大小（天玑9400+ = 16384）
 static long g_pageSz = 0;
+// ★ 新增：crash 日志路径缓存（必须是 char[]，不能是 std::string）
+static char g_crashLogPath[512] = {0};
 
 static std::vector<std::string>& loadSignatures() {
     if (!g_loadedSignatures.empty()) return g_loadedSignatures;
@@ -962,53 +964,52 @@ static const char* sigToStr(int sig) {
 }
 
 static void crashSignalHandler(int sig, siginfo_t* info, void* ucontext) {
-    // 在信号处理器中只能用 async-signal-safe 函数，不能用 LOGI
-    // 直接用 write() 写文件
-    std::string logPath = getConfigDir() + "crash_native.log";
+    // ★ 全程只用 async-signal-safe 函数：open / write / snprintf / close
+    if (g_crashLogPath[0] == '\0') goto reraise;
 
-    int fd = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd >= 0) {
-        char buf[1024];
-        int len;
+    {
+        int fd = open(g_crashLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            char buf[2048];
+            int len;
 
-        // 写入崩溃头
-        len = snprintf(buf, sizeof(buf),
-            "\n========================================\n"
-            "[NATIVE CRASH] %s\n"
-            "Fault address: %p\n"
-            "Signal code:   %d\n"
-            "Process PID:   %d\n"
-            "Timestamp:     %ld\n"
-            "========================================\n",
-            sigToStr(sig),
-            info->si_addr,
-            info->si_code,
-            getpid(),
-            (long)time(nullptr)
-        );
-        write(fd, buf, len);
+            ucontext_t* uc = (ucontext_t*)ucontext;
+            uintptr_t pc  = (uintptr_t)uc->uc_mcontext.pc;
 
-        // 尝试打印 backtrace（简单版：读 /proc/self/maps 中 PC 附近的映射）
-        ucontext_t* uc = (ucontext_t*)ucontext;
-        uintptr_t pc = uc->uc_mcontext.pc;
-        len = snprintf(buf, sizeof(buf), "PC: 0x%lx\n", (unsigned long)pc);
-        write(fd, buf, len);
-
-        // 打印寄存器快照（ARM64）
-        for (int i = 0; i < 31; i++) {
-            len = snprintf(buf, sizeof(buf), "X%-2d: 0x%lx\n", i,
-                           (unsigned long)uc->uc_mcontext.regs[i]);
+            len = snprintf(buf, sizeof(buf),
+                "\n========================================\n"
+                "[NATIVE CRASH] %s\n"
+                "Fault address : %p\n"
+                "Signal code   : %d\n"
+                "PID           : %d\n"
+                "PC            : 0x%lx\n"
+                "========================================\n",
+                sigToStr(sig),
+                info->si_addr,
+                info->si_code,
+                getpid(),
+                (unsigned long)pc
+            );
             write(fd, buf, len);
-        }
-        len = snprintf(buf, sizeof(buf), "SP:  0x%lx\nLR:  0x%lx\n",
-                       (unsigned long)uc->uc_mcontext.sp,
-                       (unsigned long)uc->uc_mcontext.regs[30]);
-        write(fd, buf, len);
 
-        close(fd);
+            // ARM64 通用寄存器 X0-X30
+            for (int i = 0; i < 31; i++) {
+                len = snprintf(buf, sizeof(buf), "X%-2d: 0x%016lx\n",
+                               i, (unsigned long)uc->uc_mcontext.regs[i]);
+                write(fd, buf, len);
+            }
+            // SP / LR
+            len = snprintf(buf, sizeof(buf),
+                           "SP : 0x%016lx\nLR : 0x%016lx\n",
+                           (unsigned long)uc->uc_mcontext.sp,
+                           (unsigned long)uc->uc_mcontext.regs[30]);
+            write(fd, buf, len);
+
+            close(fd);
+        }
     }
 
-    // 恢复原始信号处理器并重新抛出信号，让系统生成 tombstone
+reraise:
     switch (sig) {
         case SIGSEGV: sigaction(SIGSEGV, &g_oldSigSegv, nullptr); break;
         case SIGABRT: sigaction(SIGABRT, &g_oldSigAbrt, nullptr); break;
@@ -1018,17 +1019,21 @@ static void crashSignalHandler(int sig, siginfo_t* info, void* ucontext) {
 }
 
 static void installCrashHandlers() {
+    // ★ 在安装前把路径存进 char[]，信号处理器里不能用 std::string
+    std::string path = getConfigDir() + "crash_native.log";
+    snprintf(g_crashLogPath, sizeof(g_crashLogPath), "%s", path.c_str());
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crashSignalHandler;
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags     = SA_SIGINFO | SA_RESETHAND; // ★ 崩一次就自动恢复默认，让系统生成 tombstone
     sigemptyset(&sa.sa_mask);
 
     sigaction(SIGSEGV, &sa, &g_oldSigSegv);
     sigaction(SIGABRT, &sa, &g_oldSigAbrt);
     sigaction(SIGBUS,  &sa, &g_oldSigBus);
 
-    LOGI("Native crash signal handlers installed.");
+    LOGI("Crash handler installed. Log: %s", g_crashLogPath);
 }
 
 // ------------------------------------------------------------

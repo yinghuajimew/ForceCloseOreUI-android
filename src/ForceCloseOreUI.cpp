@@ -100,6 +100,8 @@ static const std::vector<const char*> SIG_FALLBACK = {
 
 static std::string g_loadedDetourType = "";
 static std::vector<std::string> g_loadedSignatures;
+// ★ 新增：运行时获取真实页面大小（天玑9400+ = 16384）
+static long g_pageSz = 0;
 
 static std::vector<std::string>& loadSignatures() {
     if (!g_loadedSignatures.empty()) return g_loadedSignatures;
@@ -707,16 +709,42 @@ static bool tryHookGroup(const ModuleInfo& mod, const std::vector<const char*>& 
     return false;
 }
 
+// ★ 新增：hook 前预解锁内存页（兼容 16KB 页面设备）
+static void prepareHookAddr(uintptr_t addr) {
+    if (g_pageSz == 0) g_pageSz = sysconf(_SC_PAGESIZE);
+    uintptr_t page_start = addr & ~((uintptr_t)g_pageSz - 1);
+    int ret = mprotect((void*)page_start, g_pageSz * 2,
+                       PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (ret != 0) {
+        LOGE("mprotect failed at 0x%lx (page=0x%lx, size=%ld): errno=%d %s",
+             addr, page_start, g_pageSz, errno, strerror(errno));
+    } else {
+        LOGI("mprotect OK at 0x%lx (page_sz=%ld)", addr, g_pageSz);
+    }
+}
+
 static bool tryInstallHook(const ModuleInfo& mod) {
     auto& sigs = loadSignatures();
     if (sigs.empty()) return false;
 
-    // 检查是否是从本地 json 成功读取的已保存特征码
-    bool isTrusted = false;
-    std::string sigPath = getConfigDir() + "signatures.json";
-    if (access(sigPath.c_str(), F_OK) == 0 && !g_loadedDetourType.empty()) {
-        isTrusted = true;
-    }
+    // 替换原来的 isTrusted 判断块
+bool isTrusted = false;
+std::string sigPath = getConfigDir() + "signatures.json";
+struct stat stSig;
+if (stat(sigPath.c_str(), &stSig) == 0 && stSig.st_size > 0) {
+    // 独立读取，不依赖 loadSignatures() 的缓存状态
+    try {
+        std::ifstream f(sigPath);
+        Json j = Json::parse(f, nullptr, false, true);
+        if (!j.is_discarded() && j.contains("detour") && j["detour"].is_string()) {
+            std::string dt = j["detour"].get<std::string>();
+            if (!dt.empty()) {
+                g_loadedDetourType = dt;  // 更新全局
+                isTrusted = true;
+            }
+        }
+    } catch (...) {}
+}
 
     std::vector<const char*> sigPtrs;
     for (auto& s : sigs) sigPtrs.push_back(s.c_str());
@@ -728,6 +756,7 @@ static bool tryInstallHook(const ModuleInfo& mod) {
         if (addr == 0) continue;
 
         LOGI("Sig[%zu] matched at 0x%lx", i, addr);
+        prepareHookAddr(addr);
 
         // 如果是已验证的特征码，直接根据记录的 Detour 挂钩，无需再等待验证
         if (isTrusted) {
@@ -750,7 +779,7 @@ static bool tryInstallHook(const ModuleInfo& mod) {
         // V1
         g_hookValid = false;
         if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
-            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            for (int w = 0; w < 100 && !g_hookValid; w++) usleep(100'000);
             if (g_hookValid) {
                 writeMatchedSignature(std::string(sigPtrs[i]), "V1");
                 LOGI("Sig[%zu] → V1 VALID!", i);
@@ -762,7 +791,7 @@ static bool tryInstallHook(const ModuleInfo& mod) {
         // V10
         g_hookValid = false;
         if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
-            for (int w = 0; w < 20 && !g_hookValid; w++) usleep(100'000);
+            for (int w = 0; w < 100 && !g_hookValid; w++) usleep(100'000);
             if (g_hookValid) {
                 writeMatchedSignature(std::string(sigPtrs[i]), "V10");
                 LOGI("Sig[%zu] → V10 VALID!", i);

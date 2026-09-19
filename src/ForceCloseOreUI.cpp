@@ -19,6 +19,8 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <sys/system_properties.h>
+#include <ctime>
 
 namespace fs = std::filesystem;
 using Json = nlohmann::ordered_json;
@@ -56,6 +58,80 @@ static void WriteLog(const char* level, const char* format, ...) {
 
 #define LOGI(...) WriteLog("INFO", __VA_ARGS__)
 #define LOGE(...) WriteLog("ERROR", __VA_ARGS__)
+
+// ------------------------------------------------------------
+// 每次启动在 debug.log 顶部写入设备环境信息
+// ------------------------------------------------------------
+static void writeLogHeader() {
+    if (g_logFilePath.empty()) return;
+
+    char manufacturer[PROP_VALUE_MAX] = {};
+    char model[PROP_VALUE_MAX]        = {};
+    char android_ver[PROP_VALUE_MAX]  = {};
+    char sdk_int[PROP_VALUE_MAX]      = {};
+    char cpu_abi[PROP_VALUE_MAX]      = {};
+    char build_fp[PROP_VALUE_MAX]     = {};
+    char device_code[PROP_VALUE_MAX]  = {};
+
+    __system_property_get("ro.product.manufacturer",  manufacturer);
+    __system_property_get("ro.product.model",         model);
+    __system_property_get("ro.build.version.release", android_ver);
+    __system_property_get("ro.build.version.sdk",     sdk_int);
+    __system_property_get("ro.product.cpu.abi",       cpu_abi);
+    __system_property_get("ro.build.fingerprint",     build_fp);
+    __system_property_get("ro.product.device",        device_code);
+
+    // 内核版本
+    char kernel_ver[256] = {};
+    {
+        FILE* kfp = fopen("/proc/version", "r");
+        if (kfp) {
+            if (fgets(kernel_ver, sizeof(kernel_ver), kfp)) {
+                size_t len = strlen(kernel_ver);
+                while (len > 0 && (kernel_ver[len-1] == '\n' || kernel_ver[len-1] == '\r'))
+                    kernel_ver[--len] = '\0';
+            }
+            fclose(kfp);
+        }
+    }
+
+    // 启动时间戳
+    char timebuf[32] = {};
+    {
+        time_t now = time(nullptr);
+        struct tm* tm_info = localtime(&now);
+        if (tm_info) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+
+    FILE* file = fopen(g_logFilePath.c_str(), "a");
+    if (!file) return;
+    fprintf(file,
+        "\n======================================================\n"
+        "[INFO] === SESSION START: %s ===\n"
+        "[INFO] Manufacturer : %s\n"
+        "[INFO] Model        : %s  (device: %s)\n"
+        "[INFO] Android      : %s  (SDK %s)\n"
+        "[INFO] CPU ABI      : %s  (page size: %ld bytes)\n"
+        "[INFO] Fingerprint  : %s\n"
+        "[INFO] Kernel       : %s\n"
+        "[INFO] PID          : %d\n"
+        "======================================================\n",
+        timebuf[0]      ? timebuf      : "unknown",
+        manufacturer[0] ? manufacturer : "unknown",
+        model[0]        ? model        : "unknown",
+        device_code[0]  ? device_code  : "?",
+        android_ver[0]  ? android_ver  : "unknown",
+        sdk_int[0]      ? sdk_int      : "?",
+        cpu_abi[0]      ? cpu_abi      : "unknown",
+        page_size,
+        build_fp[0]     ? build_fp     : "unknown",
+        kernel_ver[0]   ? kernel_ver   : "unknown",
+        getpid()
+    );
+    fclose(file);
+}
 
 // ------------------------------------------------------------
 // Game classes
@@ -283,7 +359,8 @@ static std::string getConfigDir() {
             unlink(testFile.c_str());
             cached = base;
             g_logFilePath = base + "debug.log";  // ★ 设置日志路径
-            LOGI("Using config dir: %s", base.c_str());  // 现在可以安全调用了
+            writeLogHeader();                      // ★ 立刻写入设备信息头（排在所有日志之前）
+            LOGI("Using config dir: %s", base.c_str());
             return cached;
         }
         
@@ -296,6 +373,7 @@ static std::string getConfigDir() {
     mkdir(fallback.c_str(), 0755);
     cached = fallback;
     g_logFilePath = fallback + "debug.log";  // ★ 设置日志路径
+    writeLogHeader();                          // ★ 立刻写入设备信息头
     LOGE("All external paths failed! Using internal: %s", fallback.c_str());
     return cached;
 }
@@ -459,10 +537,12 @@ if (stat(tmpStr.c_str(), &st) != 0) {
     return true;
 }
 
-static void writeMatchedSignature(const std::string& sig, const std::string& detourType) {
+static void writeMatchedSignature(const std::string& sig, const std::string& detourType,
+                                   bool forceOverwrite = false) {
     std::string sigPath = getConfigDir() + "signatures.json";
     struct stat st;
-    if (stat(sigPath.c_str(), &st) == 0 && st.st_size > 0) return;
+    // ★ forceOverwrite=true 时跳过"已存在"检查，用于 trusted sig 失效后的自动替换
+    if (!forceOverwrite && stat(sigPath.c_str(), &st) == 0 && st.st_size > 0) return;
 
     Json sigJson;
     sigJson["signatures"] = Json::array();
@@ -804,6 +884,58 @@ if (stat(sigPath.c_str(), &stSig) == 0 && stSig.st_size > 0) {
             }
             DobbyDestroy((void*)addr); orig_v10 = nullptr;
         }
+    }
+
+    // ★ AutoFallback：trusted sig 失效时（MC 升级），自动用全部内置特征码重扫
+    //   成功命中后强制覆盖 signatures.json，下次启动直接走快速路径
+    if (isTrusted) {
+        LOGI("[AutoFallback] Trusted sig no longer matches (MC may have updated). "
+             "Retrying with %zu built-in sigs...", SIG_FALLBACK.size());
+
+        for (size_t i = 0; i < SIG_FALLBACK.size(); i++) {
+            uintptr_t addr = ResolveSignature(mod, SIG_FALLBACK[i]);
+            if (addr == 0) {
+                LOGI("[AutoFallback] Sig[%zu] -> not found.", i);
+                continue;
+            }
+
+            uint8_t* raw = (uint8_t*)addr;
+            LOGI("[AutoFallback] Sig[%zu] matched at 0x%lx", i, addr);
+            LOGI("  Bytes: %02X %02X %02X %02X %02X %02X %02X %02X"
+                 " %02X %02X %02X %02X %02X %02X %02X %02X",
+                 raw[0],  raw[1],  raw[2],  raw[3],
+                 raw[4],  raw[5],  raw[6],  raw[7],
+                 raw[8],  raw[9],  raw[10], raw[11],
+                 raw[12], raw[13], raw[14], raw[15]);
+            prepareHookAddr(addr);
+
+            // 尝试 V1
+            g_hookValid = false;
+            if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
+                for (int w = 0; w < 100 && !g_hookValid; w++) usleep(100'000);
+                if (g_hookValid) {
+                    // ★ 强制覆盖旧 signatures.json，下次直接走 trusted 快速路径
+                    writeMatchedSignature(std::string(SIG_FALLBACK[i]), "V1", /*forceOverwrite=*/true);
+                    LOGI("[AutoFallback] Sig[%zu] → V1 VALID! signatures.json updated.", i);
+                    return true;
+                }
+                DobbyDestroy((void*)addr); orig_v1 = nullptr;
+            }
+
+            // 尝试 V10
+            g_hookValid = false;
+            if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
+                for (int w = 0; w < 100 && !g_hookValid; w++) usleep(100'000);
+                if (g_hookValid) {
+                    writeMatchedSignature(std::string(SIG_FALLBACK[i]), "V10", /*forceOverwrite=*/true);
+                    LOGI("[AutoFallback] Sig[%zu] → V10 VALID! signatures.json updated.", i);
+                    return true;
+                }
+                DobbyDestroy((void*)addr); orig_v10 = nullptr;
+            }
+        }
+        LOGI("[AutoFallback] All built-in sigs also exhausted. "
+             "This MC version needs a new signature.");
     }
 
     LOGI("All signatures exhausted with both detours.");

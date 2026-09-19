@@ -231,6 +231,8 @@ static volatile bool g_hookValid = false;
 struct ModuleInfo {
     uintptr_t base;
     size_t size;
+    // ★ 每个独立的 r-x 段范围，避免段间 gap（guard page / rw- 等）被错误扫描
+    std::vector<std::pair<uintptr_t, size_t>> segments;
 };
 
 static bool findMinecraftSegment(ModuleInfo& out) {
@@ -247,8 +249,9 @@ static bool findMinecraftSegment(ModuleInfo& out) {
         if (strstr(line, "libminecraftpe.so")) {
             uintptr_t start, end;
             if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                out.segments.push_back({start, end - start}); // ★ 记录每段独立范围
                 if (start < min_base) min_base = start;
-                if (end > max_end) max_end = end;
+                if (end > max_end)   max_end  = end;
                 found_so = true;
             }
         }
@@ -257,6 +260,11 @@ static bool findMinecraftSegment(ModuleInfo& out) {
     if (found_so) {
         out.base = min_base;
         out.size = max_end - min_base;
+        LOGI("Engine segments found: %zu r-x range(s), total span %zu bytes",
+             out.segments.size(), out.size);
+        for (auto& [s, sz] : out.segments) {
+            LOGI("  r-x: 0x%lx - 0x%lx (%zu bytes)", s, s + sz, sz);
+        }
         fclose(fp);
         return true;
     }
@@ -270,6 +278,8 @@ static bool findMinecraftSegment(ModuleInfo& out) {
         if ((end - start) > 30 * 1024 * 1024) {
             out.base = start;
             out.size = end - start;
+            out.segments.push_back({start, end - start}); // ★
+            LOGI("Engine fallback: single r-x segment 0x%lx (%zu bytes)", start, end - start);
             fclose(fp);
             return true;
         }
@@ -282,6 +292,9 @@ static bool findMinecraftSegment(ModuleInfo& out) {
 // ------------------------------------------------------------
 // Memory scanning
 // ------------------------------------------------------------
+// ★ 逐段扫描：只扫 r-x 段本身，跳过段间 gap（guard page、rw- 等）
+//   之前用 mod.base + [0, mod.size) 的单一大范围，会踩到 gap 里的无权限页
+//   在 OPPO Android 13 等对 W^X 管控更严的设备上会触发 SIGSEGV SEGV_ACCERR
 static uintptr_t ResolveSignature(const ModuleInfo& mod, const char* sig) {
     std::vector<int> pattern;
     const char* p = sig;
@@ -292,17 +305,21 @@ static uintptr_t ResolveSignature(const ModuleInfo& mod, const char* sig) {
         p += 2;
     }
 
-    if (mod.size < pattern.size()) return 0;
-    uint8_t* base = (uint8_t*)mod.base;
-    for (size_t i = 0; i <= mod.size - pattern.size(); i += 4) {
-        bool found = true;
-        for (size_t j = 0; j < pattern.size(); j++) {
-            if (pattern[j] != -1 && base[i + j] != (uint8_t)pattern[j]) {
-                found = false;
-                break;
+    if (pattern.empty()) return 0;
+
+    for (auto& [segBase, segSize] : mod.segments) {
+        if (segSize < pattern.size()) continue;
+        uint8_t* base = (uint8_t*)segBase;
+        for (size_t i = 0; i <= segSize - pattern.size(); i += 4) {
+            bool found = true;
+            for (size_t j = 0; j < pattern.size(); j++) {
+                if (pattern[j] != -1 && base[i + j] != (uint8_t)pattern[j]) {
+                    found = false;
+                    break;
+                }
             }
+            if (found) return (uintptr_t)(base + i);
         }
-        if (found) return (uintptr_t)(base + i);
     }
     return 0;
 }

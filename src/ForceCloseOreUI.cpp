@@ -965,6 +965,11 @@ if (stat(sigPath.c_str(), &stSig) == 0 && stSig.st_size > 0) {
 static void* InjectionThread(void*) {
     LOGI("=== Background thread STARTED (tid=%d) ===", gettid());
 
+    // ★ 即使引擎已在内存中，也等待 MC 完成自身初始化（BootstrapConfig 等）
+    // sync hook 曾经在这里之前就装钩子，与 MC 初始化竞态导致偶数次启动崩溃
+    LOGI("Waiting 500ms for MC self-initialization...");
+    usleep(500 * 1000);
+
     const int MAX_WAIT = 30000, POLL = 100;
     int waited = 0;
     ModuleInfo mod;
@@ -1199,18 +1204,10 @@ static void ForceCloseOreUI_Init() {
     
     ensureConfigExists();
 
-    ModuleInfo mod;
-    if (findMinecraftSegment(mod)) {
-        LOGI("Engine loaded at 0x%lx (%zu bytes). Sync hook...", mod.base, mod.size);
-        if (tryInstallHook(mod)) {
-            LOGI("Sync hook verified!");
-            goto start_extras;  // ★ 成功也要启动额外任务
-        }
-        LOGI("Sync hook failed. Falling back to thread...");
-    } else {
-        LOGI("Engine not loaded yet.");
-    }
-
+    // ★ 不再做同步 hook，统一走后台线程路径
+    // trusted 模式下 sync hook 装载过早，会与 MC 自身初始化（BootstrapConfig::initialize）
+    // 产生竞态，导致第偶数次启动 SIGABRT。线程路径有内置等待，规避该问题。
+    LOGI("Starting injection thread...");
     {
         pthread_t thread;
         int ret = pthread_create(&thread, nullptr, InjectionThread, nullptr);
@@ -1218,8 +1215,6 @@ static void ForceCloseOreUI_Init() {
         else pthread_detach(thread);
     }
 
-start_extras:
-    // ★ 安装崩溃信号处理器
     installCrashHandlers();
 
     // ★ 启动 logcat 抓取线程（持续运行直到游戏退出）

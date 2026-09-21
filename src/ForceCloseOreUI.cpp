@@ -746,15 +746,18 @@ static void ensureConfigExists() {
 // ------------------------------------------------------------
 // Hook callbacks
 // ------------------------------------------------------------
+// ★ 顺序很关键：先 applyConfig（把回调设成 false），再调 orig
+//   让原函数以"OreUI 禁用"状态运行，避免 orig 内部走到创建
+//   BootstrapConfig 线程的分支（否则在 trusted 模式下会在 ~173s 崩溃）
 static void detour_v1(OreUi& a1, void* a2, void* a3, void* a4, void* a5, void* a6) {
+    try { applyConfig(a1, "V1"); } catch (...) { LOGE("[V1] exception in applyConfig"); }
     orig_v1(a1, a2, a3, a4, a5, a6);
-    try { applyConfig(a1, "V1"); } catch (...) { LOGE("[V1] exception"); }
 }
 
 static void detour_v10(void* a1, void* a2, void* a3, void* a4, void* a5,
                        void* a6, void* a7, void* a8, void* a9, OreUi& a10, void* a11) {
+    try { applyConfig(a10, "V10"); } catch (...) { LOGE("[V10] exception in applyConfig"); }
     orig_v10(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    try { applyConfig(a10, "V10"); } catch (...) { LOGE("[V10] exception"); }
 }
 
 // ------------------------------------------------------------

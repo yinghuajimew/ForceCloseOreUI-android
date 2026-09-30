@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <sys/system_properties.h>
 #include <ctime>
+#include <cstring>
 
 namespace fs = std::filesystem;
 using Json = nlohmann::ordered_json;
@@ -395,6 +396,27 @@ static std::string getConfigDir() {
     return cached;
 }
 
+// ------------------------------------------------------------
+// MC 版本指纹（用 APK 安装路径里的 hash 段，每次更新安装都会变）
+// ------------------------------------------------------------
+static std::string getMcVersionStr() {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return "";
+    char line[1024];
+    std::string ver;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "libminecraftpe.so") || strstr(line, "base.apk")) {
+            char* start = strstr(line, "com.mojang.minecraftpe-");
+            if (start) {
+                char* end = strchr(start, '/');
+                if (end) { ver = std::string(start, end); break; }
+            }
+        }
+    }
+    fclose(fp);
+    return ver;
+}
+
 static std::string normPath(const fs::path& p) { return p.lexically_normal().generic_string(); }
 
 static std::string trimAscii(std::string value) {
@@ -565,6 +587,7 @@ static void writeMatchedSignature(const std::string& sig, const std::string& det
     sigJson["signatures"] = Json::array();
     sigJson["signatures"].push_back(sig);
     sigJson["detour"] = detourType; // 存入 detour 类型
+    sigJson["mc_id"]  = getMcVersionStr();
     saveConfigDocument(fs::path(sigPath), sigJson);
     LOGI("Matched signature saved to signatures.json with detour %s.", detourType.c_str());
 }
@@ -850,6 +873,22 @@ if (stat(sigPath.c_str(), &stSig) == 0 && stSig.st_size > 0) {
         }
     } catch (...) {}
 }
+
+if (isTrusted) {
+        try {
+            std::ifstream f(sigPath);
+            Json j = Json::parse(f, nullptr, false, true);
+            if (!j.is_discarded()) {
+                std::string savedId   = j.value("mc_id", "");
+                std::string currentId = getMcVersionStr();
+                if (!savedId.empty() && !currentId.empty() && savedId != currentId) {
+                    LOGI("[Trusted] MC version changed (%s → %s), invalidating trusted sig.",
+                         savedId.c_str(), currentId.c_str());
+                    isTrusted = false;  // 强制走全量验证
+                }
+            }
+        } catch (...) {}
+    }
 
     std::vector<const char*> sigPtrs;
     for (auto& s : sigs) sigPtrs.push_back(s.c_str());

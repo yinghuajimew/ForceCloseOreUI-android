@@ -1,10 +1,13 @@
 #include <sys/stat.h>
 #include <sys/mman.h> 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <set>
@@ -158,6 +161,8 @@ public:
 
 // ★ 硬编码保留作为兜底
 static const std::vector<const char*> SIG_FALLBACK = {
+    //1.26.60
+    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? B9 ? ? ? D5 F9 03 03 2A",
     //1.26.50
     "? ? ? D1 ? ? ? A9 ? ? ? F9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 F5 03 03 2A F6 03 02 2A ? ? ? F9 F4 03 01 AA",
     //1.26.40
@@ -186,6 +191,8 @@ static long g_pageSz = 0;
 static char g_crashLogPath[512] = {0};
 
 static std::vector<std::string>& loadSignatures() {
+    // ★ 缓存一份就够：这个函数只在每次扫描前调用，
+    //   读盘开销已经由 g_loadedSignatures 否空来避免。
     if (!g_loadedSignatures.empty()) return g_loadedSignatures;
 
     std::string sigPath = getConfigDir() + "signatures.json";
@@ -222,21 +229,96 @@ static std::vector<std::string>& loadSignatures() {
 
 
 // ------------------------------------------------------------
-// 自验证标志（Hook 回调写入，tryHookGroup 读取）
+// 自验证标志（Hook 回调写入，tryInstallHook 读取）
 // ------------------------------------------------------------
-static volatile bool g_hookValid = false;
+// ★ 用"代号 + 结论"打包成单个原子量，代替原来的 volatile bool。
+//   旧实现：applyConfig 成功过一次就置 true，而 tryInstallHook 下次尝试前
+//   才清 false；只要某次 detour 在清除之后跑完，这个 true 就会被下一次尝试
+//   当作"验证通过"，连后面的 V10 尝试也会立刻误判。
+//   现在每次尝试换一代，detour 只认自己那一代，跨代写入一律丢弃。
+enum class HookVerdict { Pending = 0, Valid = 1, Empty = 2, Invalid = 3 };
+
+// 暂停用于"本次尝试总预算"：特征码扫描每条都要等 10 秒验证，
+// 不加预算的话全量扫描会超出外层的整体限时。
+static int64_t monotonicMs() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int64_t g_scanDeadline = 0;
+
+static inline bool scanOutOfTime() {
+    return g_scanDeadline != 0 && monotonicMs() >= g_scanDeadline;
+}
+
+// 低 2 位是结论，高位是代号
+static std::atomic<unsigned> g_hookState{0};
+
+static inline unsigned hookStatePack(unsigned gen, HookVerdict v) {
+    return (gen << 2) | static_cast<unsigned>(v);
+}
+
+// 开一次新尝试，返回这一代的编号
+static inline unsigned beginHookAttempt() {
+    const unsigned gen = (g_hookState.load(std::memory_order_acquire) >> 2) + 1;
+    g_hookState.store(hookStatePack(gen, HookVerdict::Pending),
+                      std::memory_order_release);
+    return gen;
+}
+
+static inline unsigned currentHookGen() {
+    return g_hookState.load(std::memory_order_acquire) >> 2;
+}
+
+// 结论的"严格程度"：一旦 Valid 就不再被降级。
+// 这是为了让"orig 前 map 还空 → orig 后 map 已填充"这个序列能从
+// Empty 升级为 Valid，同时避免后续调用把已确认的结果覆盖掉。
+static inline int hookVerdictRank(HookVerdict v) {
+    switch (v) {
+        case HookVerdict::Valid:   return 3;
+        case HookVerdict::Empty:   return 2;
+        case HookVerdict::Invalid: return 1;
+        default:                   return 0;
+    }
+}
+
+// 只有代号匹配且结论不降级时才写入，避免上一代迟到的 detour 污染本次结论
+static inline void markHookVerdict(unsigned gen, HookVerdict v) {
+    unsigned cur = g_hookState.load(std::memory_order_acquire);
+    for (;;) {
+        if ((cur >> 2) != gen) return;
+        const HookVerdict after = static_cast<HookVerdict>(cur & 3u);
+        if (hookVerdictRank(v) <= hookVerdictRank(after)) return;
+        if (g_hookState.compare_exchange_weak(cur, hookStatePack(gen, v),
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+static inline HookVerdict hookAttemptVerdict() {
+    return static_cast<HookVerdict>(g_hookState.load(std::memory_order_acquire) & 3u);
+}
+
 
 // ------------------------------------------------------------
 // 智能模块定位
 // ------------------------------------------------------------
 struct ModuleInfo {
-    uintptr_t base;
-    size_t size;
+    uintptr_t base = 0;
+    size_t size = 0;
     // ★ 每个独立的 r-x 段范围，避免段间 gap（guard page / rw- 等）被错误扫描
     std::vector<std::pair<uintptr_t, size_t>> segments;
 };
 
 static bool findMinecraftSegment(ModuleInfo& out) {
+    // ★ 允许被反复调用（重试时会重新扫），每次从干净状态开始
+    out.base = 0;
+    out.size = 0;
+    out.segments.clear();
+
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) return false;
 
@@ -396,25 +478,49 @@ static std::string getConfigDir() {
     return cached;
 }
 
-// ------------------------------------------------------------
-// MC 版本指纹（用 APK 安装路径里的 hash 段，每次更新安装都会变）
-// ------------------------------------------------------------
+// ★ MC 版本指纹（用 APK 安装路径里的 hash 段，每次更新安装都会变）
+// ★ 用运行时的真实包名匹配，不要硬编码 com.mojang.minecraftpe-：
+//   改过包名的启动器（LeviLauncher 派生版等）会匹配不到 → 返回空串 →
+//   mc_id 判据静默失效，trusted 缓存永远不会被作废。
+//   查不到包名段时退回用 base.apk / libminecraftpe.so 的整行路径，
+//   至少让"路径变了"这件事能被检测到。
 static std::string getMcVersionStr() {
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) return "";
+
+    const std::string& pkg = packageName.empty() ? getPackageName() : packageName;
+    const std::string needle = pkg + "-";
+
     char line[1024];
     std::string ver;
+    std::string fallback;
     while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "libminecraftpe.so") || strstr(line, "base.apk")) {
-            char* start = strstr(line, "com.mojang.minecraftpe-");
+        if (!strstr(line, "libminecraftpe.so") && !strstr(line, "base.apk")) continue;
+
+        if (fallback.empty()) {
+            // 记录第一个命中行的路径部分，作为兜底指纹
+            char* slash = strchr(line, '/');
+            if (slash) {
+                char* nl = strchr(slash, '\n');
+                if (nl) *nl = '\0';
+                fallback = std::string(slash);
+            }
+        }
+
+        if (!pkg.empty()) {
+            char* start = strstr(line, needle.c_str());
             if (start) {
+                // 从包名起点回退到路径分隔符，取 "包名-hash" 整段
+                while (start > line && start[-1] != ' ' && start[-1] != '\t') --start;
                 char* end = strchr(start, '/');
                 if (end) { ver = std::string(start, end); break; }
             }
         }
     }
     fclose(fp);
-    return ver;
+
+    if (!ver.empty()) return ver;
+    return fallback;
 }
 
 static std::string normPath(const fs::path& p) { return p.lexically_normal().generic_string(); }
@@ -498,6 +604,44 @@ struct ConfigDocument {
     fs::path source; fs::path target; bool dirty = false;
 };
 
+// ★ 配置文档缓存：detour 现在会对同一次调用跑两遍（orig 前 / orig 后），
+//   缓存按 (路径, mtime, size) 判定有效，避免第二次重复读盘。
+//   玩家改了 config.json 之后 mtime/size 会变，缓存自动失效。
+struct ConfigCache {
+    bool valid = false;
+    std::string path;
+    long long mtimeSec = 0;
+    long long size = 0;
+    Json raw = Json::object();
+    Json canonical = Json::object();
+};
+
+static ConfigCache g_cfgCache;
+
+static bool statStamp(const std::string& p, long long& sec, long long& sz) {
+    struct stat st;
+    if (stat(p.c_str(), &st) != 0) return false;
+    // Android 的 struct stat 没有 st_mtim，秒级 mtime + 文件大小足以判断变化
+    sec = (long long)st.st_mtime;
+    sz  = (long long)st.st_size;
+    return true;
+}
+
+// 读盘结果写进 cache；返回是否真的读了盘
+static bool loadConfigIntoCache(const std::string& path, bool& parsedOk) {
+    parsedOk = false;
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) return false;
+
+    Json parsed = Json::parse(input, nullptr, false, true);
+    if (parsed.is_discarded()) return true;
+
+    g_cfgCache.raw = parsed.is_object() ? parsed : Json::object();
+    g_cfgCache.canonical = parsed.is_object() ? std::move(parsed) : Json::object();
+    parsedOk = true;
+    return true;
+}
+
 static ConfigDocument loadConfigDocument() {
     ConfigFiles files = resolveConfigFiles();
     ConfigDocument doc;
@@ -512,16 +656,36 @@ static ConfigDocument loadConfigDocument() {
         doc.dirty = true;
         return doc;
     }
-    
+
+    const std::string srcPath = doc.source.string();
+    long long sec = 0, sz = 0;
+    const bool haveStamp = statStamp(srcPath, sec, sz);
+
+    // ★ 缓存命中：路径、mtime、size 全一致就不重读
+    if (haveStamp && g_cfgCache.valid && g_cfgCache.path == srcPath &&
+        g_cfgCache.mtimeSec == sec && g_cfgCache.size == sz) {
+        doc.raw = g_cfgCache.raw;
+        doc.canonical = g_cfgCache.canonical;
+        return doc;
+    }
+
     try {
-        std::ifstream input(doc.source, std::ios::binary);
-        if (input.is_open()) {
-            Json parsed = Json::parse(input, nullptr, false, true);
-            if (!parsed.is_discarded()) {
-                doc.raw = parsed;
-                doc.canonical = parsed.is_object() ? std::move(parsed) : (doc.dirty = true, Json::object());
-            } else { doc.dirty = true; }
-        } else { doc.dirty = true; }
+        bool parsedOk = false;
+        const bool opened = loadConfigIntoCache(srcPath, parsedOk);
+        if (!opened) {
+            doc.dirty = true;
+        } else if (!parsedOk) {
+            doc.dirty = true;
+        } else {
+            doc.raw = g_cfgCache.raw;
+            doc.canonical = g_cfgCache.canonical;
+            if (haveStamp) {
+                g_cfgCache.valid = true;
+                g_cfgCache.path = srcPath;
+                g_cfgCache.mtimeSec = sec;
+                g_cfgCache.size = sz;
+            }
+        }
     } catch (...) { doc.dirty = true; }
     return doc;
 }
@@ -573,6 +737,8 @@ if (stat(tmpStr.c_str(), &st) != 0) {
     }
     
     LOGI("Config saved successfully: %s (%ld bytes)", pathStr.c_str(), (long)st.st_size);
+    // ★ 写盘后让配置缓存失效，否则同一帧内第二次 applyConfig 会用到旧内容
+    g_cfgCache.valid = false;
     return true;
 }
 
@@ -595,19 +761,25 @@ static void writeMatchedSignature(const std::string& sig, const std::string& det
 // ------------------------------------------------------------
 // applyConfig（带 Sanity Check）
 // ------------------------------------------------------------
-static void applyConfig(OreUi& ore_ui, const char* label) {
+// ★ 返回 false 表示"没有可用的配置表"（mConfigs 为空），调用方据此重试。
+//   注意：mConfigs 为空**不能**算钩错了函数——真正的 OreUi 函数被调用时
+//   map 有可能还没填充。原来的实现直接 return 不置 g_hookValid，导致正确
+//   的钩子被 DobbyDestroy 拆掉，然后 50 轮全白跑。
+static bool applyConfig(OreUi& ore_ui, const char* label, unsigned gen) {
     size_t map_size = ore_ui.mConfigs.size();
     if (map_size == 0) {
-        LOGI("[%s] mConfigs empty (size 0). Skipping.", label);
-        return;
+        LOGI("[%s] mConfigs empty (size 0) - not filled yet.", label);
+        markHookVerdict(gen, HookVerdict::Empty);
+        return false;
     }
     if (map_size > 2000) {
         LOGE("[%s] Sanity FAILED! mConfigs size = %zu.", label, map_size);
-        return;
+        markHookVerdict(gen, HookVerdict::Invalid);
+        return false;
     }
 
-    g_hookValid = true;
-    LOGI("[%s] Valid! Found %zu OreUI configs.", label, map_size);
+    markHookVerdict(gen, HookVerdict::Valid);
+    LOGI("[%s] Config applied. mConfigs size = %zu", label, map_size);
 
     ConfigDocument doc = loadConfigDocument();
     if (!doc.canonical.is_object()) { doc.canonical = Json::object(); }
@@ -639,11 +811,9 @@ static void applyConfig(OreUi& ore_ui, const char* label) {
     // ★ safe_mode 条目永远生效，不需要全局开关
     LOGI("[%s] mode=%s", label, mode_enabled ? "ON" : "OFF");
 
-    std::vector<std::string> keysOrder; // 保持 JSON 顺序
     bool dirty = false;
 
     for (auto& [name, config] : ore_ui.mConfigs) {
-        keysOrder.push_back(name);
         LOGI("[%s] -> %s", label, name.c_str());
 
         bool value = false;
@@ -712,14 +882,19 @@ if (dirty) {
     if (fp) {
         fwrite(out.data(), 1, out.size(), fp);
         fclose(fp);
-        if (rename(tmpStr.c_str(), pathStr.c_str()) == 0)
+        if (rename(tmpStr.c_str(), pathStr.c_str()) == 0) {
             LOGI("[%s] Config saved (sectioned format, %zu bytes).", label, out.size());
-        else
+            // 这里不走 saveConfigDocument，所以需要自己失效缓存
+            g_cfgCache.valid = false;
+        } else {
             LOGE("[%s] rename failed: %s", label, strerror(errno));
+        }
     } else {
         LOGE("[%s] fopen tmp failed: %s", label, strerror(errno));
     }
 }
+
+    return true;
 }
 
 
@@ -772,69 +947,64 @@ static void ensureConfigExists() {
 // ★ 顺序很关键：先 applyConfig（把回调设成 false），再调 orig
 //   让原函数以"OreUI 禁用"状态运行，避免 orig 内部走到创建
 //   BootstrapConfig 线程的分支（否则在 trusted 模式下会在 ~173s 崩溃）
+// ★ 但 orig 也可能重建/重填 mConfigs，把刚写进去的回调覆盖掉，
+//   所以 orig 之后再补一次（配置文档按 mtime/size 缓存，第二次不重复读盘）。
 static void detour_v1(OreUi& a1, void* a2, void* a3, void* a4, void* a5, void* a6) {
-    try { applyConfig(a1, "V1"); } catch (...) { LOGE("[V1] exception in applyConfig"); }
+    const unsigned gen = currentHookGen();
+    try { applyConfig(a1, "V1", gen); } catch (...) { LOGE("[V1] exception in applyConfig"); }
     orig_v1(a1, a2, a3, a4, a5, a6);
+    try { applyConfig(a1, "V1/reapply", gen); } catch (...) { LOGE("[V1] exception in reapply"); }
 }
 
 static void detour_v10(void* a1, void* a2, void* a3, void* a4, void* a5,
                        void* a6, void* a7, void* a8, void* a9, OreUi& a10, void* a11) {
-    try { applyConfig(a10, "V10"); } catch (...) { LOGE("[V10] exception in applyConfig"); }
+    const unsigned gen = currentHookGen();
+    try { applyConfig(a10, "V10", gen); } catch (...) { LOGE("[V10] exception in applyConfig"); }
     orig_v10(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    try { applyConfig(a10, "V10/reapply", gen); } catch (...) { LOGE("[V10] exception in reapply"); }
 }
 
 // ------------------------------------------------------------
-// 自验证 Hook 安装：安装后立刻调原函数一次，
-// 如果 Sanity Check 失败就自动卸载，继续尝试下一条签名
+// 自验证 Hook 安装
 // ------------------------------------------------------------
-template<typename OrigPtr>
-static bool tryHookGroup(const ModuleInfo& mod, const std::vector<const char*>& sigs,
-                         void* detour, OrigPtr** orig_out,
-                         const char* label) {
-    for (size_t i = 0; i < sigs.size(); i++) {
-        LOGI("  Trying %s [%zu/%zu]...", label, i + 1, sigs.size());
-        uintptr_t addr = ResolveSignature(mod, sigs[i]);
-        if (addr == 0) {
-            LOGI("  %s [%zu] -> not found.", label, i + 1);
-            continue;
-        }
+// ★ 安装一条钩子并等待游戏自己调用它，用 detour 内的 Sanity Check 判定对错。
+//     Valid   —— 函数被调用且 mConfigs 大小合理，句柄保留
+//     Empty   —— 函数被调用但 mConfigs 为空（还没填充）。没有东西可改，
+//                但销毁钩子会漏掉真正的目标函数，所以保留并告警
+//     Invalid —— 函数没被调用，或 size 明显畸形（>2000）→ 拆掉换下一条
+static HookVerdict tryHookOnce(uintptr_t addr, bool v1) {
+    const unsigned gen = beginHookAttempt();
 
-        // 打印匹配地址处的前 16 字节，方便用户用 IDA 核实
-        uint8_t* raw = (uint8_t*)addr;
-        LOGI("  %s [%zu] -> MATCHED at 0x%lx", label, i + 1, addr);
-        LOGI("    Bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-             raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]);
+    void* detour = v1 ? (void*)detour_v1 : (void*)detour_v10;
+    void** origSlot = v1 ? (void**)&orig_v1 : (void**)&orig_v10;
 
-        // 重置自验证标志
-        g_hookValid = false;
-
-        if (DobbyHook((void*)addr, detour, (void**)orig_out) != 0) {
-            LOGE("  DobbyHook failed at 0x%lx", addr);
-            continue;
-        }
-
-        LOGI("  DobbyHook installed. Triggering validation...");
-
-        // 调用原函数一次来触发 Sanity Check
-        // 注意：只有当这个函数会被游戏启动阶段调用时才能验证
-        // 给 2 秒时间等待回调触发
-        for (int w = 0; w < 20; w++) {
-            if (g_hookValid) break;
-            usleep(100 * 1000);
-        }
-
-        if (g_hookValid) {
-            LOGI("  %s [%zu] -> VALID hook! Confirmed correct function.", label, i + 1);
-            return true;
-        }
-
-        // Sanity Check 没通过 → 卸载这个错误的 Hook
-        LOGE("  %s [%zu] -> INVALID hook (validation failed). Unhooking and trying next...", label, i + 1);
-        DobbyDestroy((void*)addr);
-        *orig_out = nullptr;
+    if (DobbyHook((void*)addr, detour, origSlot) != 0) {
+        LOGE("  DobbyHook failed at 0x%lx", addr);
+        markHookVerdict(gen, HookVerdict::Invalid);
+        return HookVerdict::Invalid;
     }
-    return false;
+
+    // ★ 等到 Valid 或超时。不能一见 Empty 就还回去：
+    //   detour 内部是"先 applyConfig → orig → 再 applyConfig"，
+    //   orig 才是填 mConfigs 的那一步，所以第一次调用前半段必然是空的。
+    //   等下去，后半段会把结论升级成 Valid。
+    for (int w = 0; w < 100; w++) {
+        if (hookAttemptVerdict() == HookVerdict::Valid) break;
+        usleep(100 * 1000);
+    }
+
+    const HookVerdict verdict = hookAttemptVerdict();
+    if (verdict == HookVerdict::Valid) return HookVerdict::Valid;
+
+    if (verdict == HookVerdict::Empty) {
+        // 函数确实被调用了，只是这一次没填进去东西。
+        // 非 Invalid 非 Valid：保留句柄，等下一次调用。
+        return HookVerdict::Empty;
+    }
+
+    DobbyDestroy((void*)addr);
+    *origSlot = nullptr;
+    return HookVerdict::Invalid;
 }
 
 // ★ 新增：hook 前预解锁内存页（兼容 16KB 页面设备）
@@ -851,150 +1021,153 @@ static void prepareHookAddr(uintptr_t addr) {
     }
 }
 
-static bool tryInstallHook(const ModuleInfo& mod) {
-    auto& sigs = loadSignatures();
-    if (sigs.empty()) return false;
+// 读取 signatures.json（detour 类型 + mc_id），用于 trusted 快速路径判断
+struct SigCache {
+    bool hasSig = false;
+    std::string firstSig;
+    std::string detour;
+    std::string mcId;
+};
 
-    // 替换原来的 isTrusted 判断块
-bool isTrusted = false;
-std::string sigPath = getConfigDir() + "signatures.json";
-struct stat stSig;
-if (stat(sigPath.c_str(), &stSig) == 0 && stSig.st_size > 0) {
-    // 独立读取，不依赖 loadSignatures() 的缓存状态
+static SigCache readSigCache() {
+    SigCache cache;
+    std::string sigPath = getConfigDir() + "signatures.json";
+    struct stat st;
+    if (stat(sigPath.c_str(), &st) != 0 || st.st_size <= 0) return cache;
+
     try {
         std::ifstream f(sigPath);
         Json j = Json::parse(f, nullptr, false, true);
-        if (!j.is_discarded() && j.contains("detour") && j["detour"].is_string()) {
-            std::string dt = j["detour"].get<std::string>();
-            if (!dt.empty()) {
-                g_loadedDetourType = dt;  // 更新全局
-                isTrusted = true;
-            }
+        if (j.is_discarded()) return cache;
+
+        if (j.contains("signatures") && j["signatures"].is_array() &&
+            !j["signatures"].empty() && j["signatures"][0].is_string()) {
+            cache.firstSig = j["signatures"][0].get<std::string>();
+            cache.hasSig = !cache.firstSig.empty();
         }
+        if (j.contains("detour") && j["detour"].is_string())
+            cache.detour = j["detour"].get<std::string>();
+        if (j.contains("mc_id") && j["mc_id"].is_string())
+            cache.mcId = j["mc_id"].get<std::string>();
     } catch (...) {}
+    return cache;
 }
 
-if (isTrusted) {
-        try {
-            std::ifstream f(sigPath);
-            Json j = Json::parse(f, nullptr, false, true);
-            if (!j.is_discarded()) {
-                std::string savedId   = j.value("mc_id", "");
-                std::string currentId = getMcVersionStr();
-                if (!savedId.empty() && !currentId.empty() && savedId != currentId) {
-                    LOGI("[Trusted] MC version changed (%s → %s), invalidating trusted sig.",
-                         savedId.c_str(), currentId.c_str());
-                    isTrusted = false;  // 强制走全量验证
-                }
+// 在 addr 处装钩子并验证。preferredDetour 非空时先试它，再补另一代。
+// 返回 true 表示钩子已在位（Valid 或 Empty 都算在位）。
+static bool installAt(uintptr_t addr, const std::string& sigText,
+                      const std::string& preferredDetour, bool writeCache) {
+    prepareHookAddr(addr);
+
+    std::vector<std::string> order;
+    if (!preferredDetour.empty()) order.push_back(preferredDetour);
+    if (preferredDetour != "V1")  order.push_back("V1");
+    if (preferredDetour != "V10") order.push_back("V10");
+
+    for (const auto& name : order) {
+        const bool v1 = (name == "V1");
+        const HookVerdict verdict = tryHookOnce(addr, v1);
+
+        if (verdict == HookVerdict::Valid) {
+            if (writeCache) {
+                // ★ 一律 force 覆盖：旧代码在 fallback 路径上不带 force，
+                //   导致已存在的过期 signatures.json 永远改不掉，下次仍走错路。
+                writeMatchedSignature(sigText, name, /*forceOverwrite=*/true);
             }
-        } catch (...) {}
+            LOGI("  → %s hook VALID (%s)", name.c_str(),
+                 writeCache ? "signatures.json updated" : "trusted, cache kept");
+            return true;
+        }
+
+        if (verdict == HookVerdict::Empty) {
+            // 函数确实被调用了，只是 map 还没填充。目标大概率就是它，
+            // 拆掉钩子会直接错过真正需要的时机，所以保留并告警。
+            // ★ 一样写进缓存：钩子位置已经确定是对的，下次启动没必要再白扫一遍。
+            if (writeCache) {
+                writeMatchedSignature(sigText, name, /*forceOverwrite=*/true);
+            }
+            LOGE("  → %s hook fired but mConfigs is empty. Keeping hook (config will "
+                 "apply on a later call); this build may need a new signature.",
+                 name.c_str());
+            return true;
+        }
+
+        LOGE("  → %s hook INVALID (not called or bad sanity). Trying next.", name.c_str());
+    }
+    return false;
+}
+
+static bool tryInstallHook(const ModuleInfo& mod) {
+    // 用户可能往 signatures.json 里加了自己的特征码，所以全量列表要合并内置的
+    std::vector<std::string> all = loadSignatures();
+    for (auto s : SIG_FALLBACK) {
+        const std::string sig(s);
+        if (std::find(all.begin(), all.end(), sig) == all.end()) all.push_back(sig);
+    }
+    if (all.empty()) return false;
+
+    // --------------------------------------------------------
+    // 1) trusted 快速路径：直接按记录下来的 detour 挂钩，跳过 10s 验证
+    // --------------------------------------------------------
+    SigCache cache = readSigCache();
+    if (cache.hasSig && !cache.detour.empty()) {
+        const std::string currentId = getMcVersionStr();
+        const bool stale = !cache.mcId.empty() && !currentId.empty() &&
+                           cache.mcId != currentId;
+
+        if (stale) {
+            LOGI("[Trusted] MC id changed (%s → %s). Discarding cached sig.",
+                 cache.mcId.c_str(), currentId.c_str());
+            g_loadedDetourType.clear();
+        } else if (cache.detour != "V1" && cache.detour != "V10") {
+            LOGE("[Trusted] Unknown detour '%s' in signatures.json. Rebuilding.",
+                 cache.detour.c_str());
+            g_loadedDetourType.clear();
+        } else {
+            uintptr_t addr = scanOutOfTime() ? 0 : ResolveSignature(mod, cache.firstSig.c_str());
+            if (addr != 0) {
+                LOGI("[Trusted] Cached sig matched at 0x%lx (detour=%s).",
+                     addr, cache.detour.c_str());
+                g_loadedDetourType = cache.detour;
+                if (installAt(addr, cache.firstSig, cache.detour, /*writeCache=*/false)) {
+                    return true;
+                }
+                LOGI("[Trusted] Cached sig did not hook cleanly; falling back to full scan.");
+            } else {
+                LOGI("[Trusted] Cached sig no longer matches this build; full scan.");
+            }
+        }
     }
 
-    std::vector<const char*> sigPtrs;
-    for (auto& s : sigs) sigPtrs.push_back(s.c_str());
+    // --------------------------------------------------------
+    // 2) 全量扫描：缓存里的 sig（含用户自加的）+ 内置兜底
+    //    ★ 无论 trusted 与否都走这里。旧实现把这一段包在 if (isTrusted) 里，
+    //      而 mc_id 变化恰好会先把它置 false —— 于是在最需要它的场景
+    //      （MC 升级后）整段被跳过，mod 直接失效且无法自愈。
+    // --------------------------------------------------------
+    LOGI("Full signature scan over %zu sigs...", all.size());
 
-    LOGI("Starting signature scan (%zu sigs, trusted=%s)...", sigs.size(), isTrusted ? "YES" : "NO");
-
-    for (size_t i = 0; i < sigPtrs.size(); i++) {
-        uintptr_t addr = ResolveSignature(mod, sigPtrs[i]);
+    for (size_t i = 0; i < all.size(); i++) {
+        if (scanOutOfTime()) {
+            LOGE("Scan time budget exhausted at sig[%zu/%zu].", i, all.size());
+            return false;
+        }
+        uintptr_t addr = ResolveSignature(mod, all[i].c_str());
         if (addr == 0) continue;
 
+        uint8_t* raw = (uint8_t*)addr;
         LOGI("Sig[%zu] matched at 0x%lx", i, addr);
-        prepareHookAddr(addr);
+        LOGI("  Bytes: %02X %02X %02X %02X %02X %02X %02X %02X"
+             " %02X %02X %02X %02X %02X %02X %02X %02X",
+             raw[0],  raw[1],  raw[2],  raw[3],
+             raw[4],  raw[5],  raw[6],  raw[7],
+             raw[8],  raw[9],  raw[10], raw[11],
+             raw[12], raw[13], raw[14], raw[15]);
 
-        // 如果是已验证的特征码，直接根据记录的 Detour 挂钩，无需再等待验证
-        if (isTrusted) {
-            if (g_loadedDetourType == "V1") {
-                if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
-                    LOGI("Sig[%zu] → V1 Hooked (Trusted, skip validation)", i);
-                    return true;
-                }
-            } else if (g_loadedDetourType == "V10") {
-                if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
-                    LOGI("Sig[%zu] → V10 Hooked (Trusted, skip validation)", i);
-                    return true;
-                }
-            }
-            continue;
+        if (installAt(addr, all[i], /*preferredDetour=*/"", /*writeCache=*/true)) {
+            LOGI("Sig[%zu] installed and verified; signatures.json updated.", i);
+            return true;
         }
-
-        // --- 以下为 fallback 特征码匹配时的原验证逻辑 ---
-        
-        // V1
-        g_hookValid = false;
-        if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
-            for (int w = 0; w < 100 && !g_hookValid; w++) usleep(100'000);
-            if (g_hookValid) {
-                writeMatchedSignature(std::string(sigPtrs[i]), "V1");
-                LOGI("Sig[%zu] → V1 VALID!", i);
-                return true;
-            }
-            DobbyDestroy((void*)addr); orig_v1 = nullptr;
-        }
-
-        // V10
-        g_hookValid = false;
-        if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
-            for (int w = 0; w < 100 && !g_hookValid; w++) usleep(100'000);
-            if (g_hookValid) {
-                writeMatchedSignature(std::string(sigPtrs[i]), "V10");
-                LOGI("Sig[%zu] → V10 VALID!", i);
-                return true;
-            }
-            DobbyDestroy((void*)addr); orig_v10 = nullptr;
-        }
-    }
-
-    // ★ AutoFallback：trusted sig 失效时（MC 升级），自动用全部内置特征码重扫
-    //   成功命中后强制覆盖 signatures.json，下次启动直接走快速路径
-    if (isTrusted) {
-        LOGI("[AutoFallback] Trusted sig no longer matches (MC may have updated). "
-             "Retrying with %zu built-in sigs...", SIG_FALLBACK.size());
-
-        for (size_t i = 0; i < SIG_FALLBACK.size(); i++) {
-            uintptr_t addr = ResolveSignature(mod, SIG_FALLBACK[i]);
-            if (addr == 0) {
-                LOGI("[AutoFallback] Sig[%zu] -> not found.", i);
-                continue;
-            }
-
-            uint8_t* raw = (uint8_t*)addr;
-            LOGI("[AutoFallback] Sig[%zu] matched at 0x%lx", i, addr);
-            LOGI("  Bytes: %02X %02X %02X %02X %02X %02X %02X %02X"
-                 " %02X %02X %02X %02X %02X %02X %02X %02X",
-                 raw[0],  raw[1],  raw[2],  raw[3],
-                 raw[4],  raw[5],  raw[6],  raw[7],
-                 raw[8],  raw[9],  raw[10], raw[11],
-                 raw[12], raw[13], raw[14], raw[15]);
-            prepareHookAddr(addr);
-
-            // 尝试 V1
-            g_hookValid = false;
-            if (DobbyHook((void*)addr, (void*)detour_v1, (void**)&orig_v1) == 0) {
-                for (int w = 0; w < 100 && !g_hookValid; w++) usleep(100'000);
-                if (g_hookValid) {
-                    // ★ 强制覆盖旧 signatures.json，下次直接走 trusted 快速路径
-                    writeMatchedSignature(std::string(SIG_FALLBACK[i]), "V1", /*forceOverwrite=*/true);
-                    LOGI("[AutoFallback] Sig[%zu] → V1 VALID! signatures.json updated.", i);
-                    return true;
-                }
-                DobbyDestroy((void*)addr); orig_v1 = nullptr;
-            }
-
-            // 尝试 V10
-            g_hookValid = false;
-            if (DobbyHook((void*)addr, (void*)detour_v10, (void**)&orig_v10) == 0) {
-                for (int w = 0; w < 100 && !g_hookValid; w++) usleep(100'000);
-                if (g_hookValid) {
-                    writeMatchedSignature(std::string(SIG_FALLBACK[i]), "V10", /*forceOverwrite=*/true);
-                    LOGI("[AutoFallback] Sig[%zu] → V10 VALID! signatures.json updated.", i);
-                    return true;
-                }
-                DobbyDestroy((void*)addr); orig_v10 = nullptr;
-            }
-        }
-        LOGI("[AutoFallback] All built-in sigs also exhausted. "
-             "This MC version needs a new signature.");
     }
 
     LOGI("All signatures exhausted with both detours.");
@@ -1014,11 +1187,12 @@ static void* InjectionThread(void*) {
 
     const int MAX_WAIT = 30000, POLL = 100;
     int waited = 0;
-    ModuleInfo mod;
 
     while (waited < MAX_WAIT) {
-        if (findMinecraftSegment(mod)) {
-            LOGI("Engine found at 0x%lx (%zu bytes) after %d ms", mod.base, mod.size, waited);
+        ModuleInfo probe;
+        if (findMinecraftSegment(probe)) {
+            LOGI("Engine found at 0x%lx (%zu bytes) after %d ms",
+                 probe.base, probe.size, waited);
             break;
         }
         if (waited % 1000 == 0) LOGI("Waiting... (%d ms)", waited);
@@ -1026,21 +1200,45 @@ static void* InjectionThread(void*) {
         waited += POLL;
     }
 
-    if (!mod.base) {
-        LOGE("Engine not found after %d ms.", MAX_WAIT);
-        return nullptr;
-    }
+    // ★ 钩子只有在游戏真正调用目标函数后才能验证，所以要给它时间。
+    // 旧实现是固定 50 轮、每轮把全部特征码 x 两种 detour 各等 10 秒，
+    // 最坏要跑两个多小时才打印失败。现在改成：扫一遍，失败后只有在
+    // "引擎 r-x 段布局变了"（MC 懒加载了新段）时才重扫，并且全程有截止时间。
+    const int64_t deadline = monotonicMs() + 180 * 1000; // 总共最多 3 分钟
+    g_scanDeadline = deadline;
 
-    for (int attempt = 1; attempt <= 50; attempt++) {
-        LOGI("=== Attempt %d/50 ===", attempt);
-        if (tryInstallHook(mod)) {
-            LOGI("=== Hook verified on attempt %d! ===", attempt);
+    std::vector<std::pair<uintptr_t, size_t>> lastLayout;
+    int attempt = 0;
+
+    while (monotonicMs() < deadline) {
+        ModuleInfo fresh;
+        if (!findMinecraftSegment(fresh)) {
+            LOGE("Engine mapping disappeared, retrying.");
+            usleep(500 * 1000);
+            continue;
+        }
+
+        // 布局没变就不重扫（特征码不会自己变，重扫只是白等）
+        if (!lastLayout.empty() && lastLayout == fresh.segments) {
+            usleep(1000 * 1000);
+            continue;
+        }
+        lastLayout = fresh.segments;
+
+        attempt++;
+        LOGI("=== Scan attempt %d over %zu r-x segment(s) ===",
+             attempt, fresh.segments.size());
+
+        if (tryInstallHook(fresh)) {
+            LOGI("=== Hook installed on scan attempt %d ===", attempt);
             return nullptr;
         }
-        usleep(200 * 1000);
+        usleep(500 * 1000);
     }
 
-    LOGE("Failed after 50 attempts. No signature matched this version.");
+    LOGE("Gave up after %d scan attempt(s). No signature matched this MC build; "
+         "a new signature is needed (edit signatures.json or update SIG_FALLBACK).",
+         attempt);
     return nullptr;
 }
 

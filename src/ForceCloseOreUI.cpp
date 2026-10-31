@@ -378,7 +378,7 @@ static bool findMinecraftSegment(ModuleInfo& out) {
 // ★ 逐段扫描：只扫 r-x 段本身，跳过段间 gap（guard page、rw- 等）
 //   之前用 mod.base + [0, mod.size) 的单一大范围，会踩到 gap 里的无权限页
 //   在 OPPO Android 13 等对 W^X 管控更严的设备上会触发 SIGSEGV SEGV_ACCERR
-static uintptr_t ResolveSignature(const ModuleInfo& mod, const char* sig) {
+static std::vector<int> ParsePattern(const char* sig) {
     std::vector<int> pattern;
     const char* p = sig;
     while (*p) {
@@ -387,13 +387,60 @@ static uintptr_t ResolveSignature(const ModuleInfo& mod, const char* sig) {
         pattern.push_back(strtol(p, nullptr, 16));
         p += 2;
     }
+    return pattern;
+}
 
-    if (pattern.empty()) return 0;
+// ★ 只取第一个匹配点是不够的。
+//   Sig[4] 这种 44 字节里 27 个通配的模式（"?? ? D1" 开头 = 任意 sub sp,sp,#imm），
+//   320MB 代码段里前 17 个固定字节完全相同的函数不止一个。旧实现命中第一个就
+//   开始挂钩，一旦那个恰好是个没人调用的同名 prologue，就是"hook INVALID"
+//   然后换下一条特征码 —— 真正的目标函数根本没被试过。
+//   现在按顺序收集所有匹配点，交给调用方逐个试。
+// 在 pattern 里找最长的一段连续固定字节，作为扫描锚点。
+// 锚点越长，绝大多数位置在第一个字节就对不上，扫描快得多。
+struct Anchor {
+    size_t offset = 0;   // 锚点在 pattern 中的偏移
+    std::vector<uint8_t> bytes;
+};
+
+static Anchor FindAnchor(const std::vector<int>& pattern) {
+    Anchor best;
+    size_t i = 0;
+    while (i < pattern.size()) {
+        if (pattern[i] == -1) { i++; continue; }
+        size_t j = i;
+        while (j < pattern.size() && pattern[j] != -1) j++;
+        if (j - i > best.bytes.size()) {
+            best.offset = i;
+            best.bytes.assign(pattern.begin() + i, pattern.begin() + j);
+        }
+        i = j;
+    }
+    return best;
+}
+
+static void ResolveSignatureAll(const ModuleInfo& mod, const char* sig,
+                                std::vector<uintptr_t>& out, size_t maxCount) {
+    out.clear();
+    const std::vector<int> pattern = ParsePattern(sig);
+    if (pattern.empty() || maxCount == 0) return;
+
+    const Anchor anchor = FindAnchor(pattern);
+    const uint8_t* anchorBytes = anchor.bytes.empty() ? nullptr : anchor.bytes.data();
+    const size_t anchorLen = anchor.bytes.size();
 
     for (auto& [segBase, segSize] : mod.segments) {
         if (segSize < pattern.size()) continue;
         uint8_t* base = (uint8_t*)segBase;
+
         for (size_t i = 0; i <= segSize - pattern.size(); i += 4) {
+            // 先用最长的固定段筛一遍：锚点首字节对不上就立刻跳到下一个位置，
+            // 不必走完整个 pattern。这一条把扫描从"每个位置 44 次比较"
+            // 降到"绝大多数位置 1 次比较"。
+            if (anchorBytes && base[i + anchor.offset] != anchorBytes[0]) {
+                continue;
+            }
+
             bool found = true;
             for (size_t j = 0; j < pattern.size(); j++) {
                 if (pattern[j] != -1 && base[i + j] != (uint8_t)pattern[j]) {
@@ -401,10 +448,18 @@ static uintptr_t ResolveSignature(const ModuleInfo& mod, const char* sig) {
                     break;
                 }
             }
-            if (found) return (uintptr_t)(base + i);
+            if (found) {
+                out.push_back((uintptr_t)(base + i));
+                if (out.size() >= maxCount) return;
+            }
         }
     }
-    return 0;
+}
+
+static uintptr_t ResolveSignature(const ModuleInfo& mod, const char* sig) {
+    std::vector<uintptr_t> hits;
+    ResolveSignatureAll(mod, sig, hits, 1);
+    return hits.empty() ? 0 : hits[0];
 }
 
 // ------------------------------------------------------------
@@ -972,8 +1027,44 @@ static void detour_v10(void* a1, void* a2, void* a3, void* a4, void* a5,
 //     Empty   —— 函数被调用但 mConfigs 为空（还没填充）。没有东西可改，
 //                但销毁钩子会漏掉真正的目标函数，所以保留并告警
 //     Invalid —— 函数没被调用，或 size 明显畸形（>2000）→ 拆掉换下一条
-static HookVerdict tryHookOnce(uintptr_t addr, bool v1) {
+// 单个安装点的等待时间。
+// 原来是固定 10 秒 —— 一条特征码只试一个点的时候还撑得住，现在同一个
+// 特征码要试好几个匹配点，10 秒 × 6 点 × 2 detour = 120 秒，光一条就把
+// 全部预算（180 秒）吃掉了。游戏构造 OreUI 配置通常在一两秒内完成，
+// 2.5 秒足够；真正没被调用的点也能很快放过。
+static const int kAttemptWaitMs = 2500;
+
+// 观察期：装好钩子后最多再等这么久，等游戏自己调用它。
+// 之所以要单独一段：OreUI 配置函数通常只在进入某个界面时才调用一次，
+// 从启动到那时可能十几秒。给 2.5 秒等于直接判死。
+// 每个候选最长等这么多，实际还会被全局扫描预算截断（见 hookWaitBudgetMs）。
+static const int kExtendedWaitMs = 30000;
+
+static int hookWaitMs(unsigned gen) {
+    // 全局预算不够时缩短观察期，避免一条候选吃光所有机会
+    if (g_scanDeadline == 0) return kExtendedWaitMs;
+    const int64_t left = g_scanDeadline - monotonicMs();
+    if (left <= 0) return 0;
+    return (int)std::min<int64_t>(kExtendedWaitMs, left);
+}
+
+static HookVerdict waitForHook(unsigned gen) {
+    const int budget = hookWaitMs(gen);
+    const int slices = budget / 250;
+    for (int w = 0; w < slices; w++) {
+        // 只认这一代：期间的其它尝试会换代，跨代结论一律丢弃
+        const unsigned cur = g_hookState.load(std::memory_order_acquire);
+        if ((cur >> 2) != gen) return HookVerdict::Invalid;
+        const HookVerdict v = static_cast<HookVerdict>(cur & 3u);
+        if (v == HookVerdict::Valid || v == HookVerdict::Empty) return v;
+        usleep(250 * 1000);
+    }
+    return HookVerdict::Pending;
+}
+
+static HookVerdict tryHookOnce(uintptr_t addr, bool v1, unsigned* outGen = nullptr) {
     const unsigned gen = beginHookAttempt();
+    if (outGen) *outGen = gen;
 
     void* detour = v1 ? (void*)detour_v1 : (void*)detour_v10;
     void** origSlot = v1 ? (void**)&orig_v1 : (void**)&orig_v10;
@@ -984,27 +1075,30 @@ static HookVerdict tryHookOnce(uintptr_t addr, bool v1) {
         return HookVerdict::Invalid;
     }
 
-    // ★ 等到 Valid 或超时。不能一见 Empty 就还回去：
-    //   detour 内部是"先 applyConfig → orig → 再 applyConfig"，
+
+    // ★ 等到 Valid / Empty，或者这一段等待用完。
+    //   不能一见 Empty 就还回去：detour 内部是"先 applyConfig → orig → 再 applyConfig"，
     //   orig 才是填 mConfigs 的那一步，所以第一次调用前半段必然是空的。
     //   等下去，后半段会把结论升级成 Valid。
-    for (int w = 0; w < 100; w++) {
-        if (hookAttemptVerdict() == HookVerdict::Valid) break;
+    //   反过来，只要不是 Pending（= detour 至少进过一次）就可以提前收工。
+    const int slices = kAttemptWaitMs / 100;
+    for (int w = 0; w < slices; w++) {
+        const HookVerdict v = hookAttemptVerdict();
+        if (v == HookVerdict::Valid || v == HookVerdict::Empty) break;
         usleep(100 * 1000);
     }
 
     const HookVerdict verdict = hookAttemptVerdict();
     if (verdict == HookVerdict::Valid) return HookVerdict::Valid;
+    if (verdict == HookVerdict::Empty) return HookVerdict::Empty;
 
-    if (verdict == HookVerdict::Empty) {
-        // 函数确实被调用了，只是这一次没填进去东西。
-        // 非 Invalid 非 Valid：保留句柄，等下一次调用。
-        return HookVerdict::Empty;
-    }
-
-    DobbyDestroy((void*)addr);
-    *origSlot = nullptr;
-    return HookVerdict::Invalid;
+    // ★ 这里**不能** DobbyDestroy。
+    //   "这 2.5 秒内没被调用"不等于"地址是错的"：OreUI 配置函数只在进到
+    //   某个界面时才调一次，手机上从启动到主菜单常常要十几秒。旧代码在这里
+    //   直接拆钩子，等于只给了 2.5 秒机会 —— 这正是日志里"hook INVALID
+    //   (not called)"最常见的来源。
+    //   保留句柄，交给调用方在后续几轮里继续等（见 waitForHookOutcome）。
+    return HookVerdict::Pending;
 }
 
 // ★ 新增：hook 前预解锁内存页（兼容 16KB 页面设备）
@@ -1066,7 +1160,8 @@ static bool installAt(uintptr_t addr, const std::string& sigText,
 
     for (const auto& name : order) {
         const bool v1 = (name == "V1");
-        const HookVerdict verdict = tryHookOnce(addr, v1);
+        unsigned gen = 0;
+        const HookVerdict verdict = tryHookOnce(addr, v1, &gen);
 
         if (verdict == HookVerdict::Valid) {
             if (writeCache) {
@@ -1080,9 +1175,10 @@ static bool installAt(uintptr_t addr, const std::string& sigText,
         }
 
         if (verdict == HookVerdict::Empty) {
-            // 函数确实被调用了，只是 map 还没填充。目标大概率就是它，
-            // 拆掉钩子会直接错过真正需要的时机，所以保留并告警。
-            // ★ 一样写进缓存：钩子位置已经确定是对的，下次启动没必要再白扫一遍。
+            // detour 被调用了 → 地址是对的，直接接受。
+            // （不要在这里"继续试下一个候选"：order 里的下一个 detour 用的是同一个
+            //  addr，再 DobbyHook 一次会嵌套改写同一个函数头，把刚挂好的钩子搞坏。）
+            // mConfigs 为空只说明这张表还没填，下一次调用会补上。
             if (writeCache) {
                 writeMatchedSignature(sigText, name, /*forceOverwrite=*/true);
             }
@@ -1092,7 +1188,81 @@ static bool installAt(uintptr_t addr, const std::string& sigText,
             return true;
         }
 
-        LOGE("  → %s hook INVALID (not called or bad sanity). Trying next.", name.c_str());
+        if (verdict == HookVerdict::Pending) {
+            // 装上了但这段窗口里没被调用。给它一段更长的观察期再决定：
+            // 目标函数可能在用户进入某个界面时才被调，拆早了就永远错过。
+            const HookVerdict later = waitForHook(gen);
+            if (later == HookVerdict::Valid || later == HookVerdict::Empty) {
+                if (writeCache) {
+                    writeMatchedSignature(sigText, name, /*forceOverwrite=*/true);
+                }
+                LOGI("  → %s hook confirmed after extended wait (%s).", name.c_str(),
+                     later == HookVerdict::Valid ? "config applied" : "mConfigs still empty");
+                return true;
+            }
+            // 观察期也没动静：拆掉换下一种。
+            // 注意这里**不能**用 Pending 判"地址是错的" —— 只能判"这个 detour
+            // 在这段时间里没等到调用"。下一种 detour 会重新挂钩同一个地址，
+            // 所以必须先彻底拆干净（orig 槽也要置空，trampoline 释放后它悬空）。
+            LOGE("  → %s hook was installed but never called within the wait window; "
+                 "trying the other detour.", name.c_str());
+            if (v1) orig_v1 = nullptr;
+            else    orig_v10 = nullptr;
+            DobbyDestroy((void*)addr);
+            continue;
+        }
+
+        LOGE("  → %s hook INVALID (DobbyHook rejected or bad sanity). Trying next.",
+             name.c_str());
+    }
+    return false;
+}
+
+// 每条特征码最多试几个匹配点。多试几个能救回"撞到同名 prologue"的情况，
+// 但每个点都要等最多 10 秒验证，所以要有个上限。
+static const size_t kMaxHitsPerSig = 6;
+
+// ------------------------------------------------------------
+// 预扫描缓存
+// ------------------------------------------------------------
+// 扫描本身只是只读遍历 r-x 段，不碰 MC 的任何状态，所以可以在等
+// BootstrapConfig 初始化那 500ms 里先跑完。等真正要挂钩时直接查表，
+// 省掉 2~5 秒 —— 这 2~5 秒恰好是"钩子装上时目标函数已经被调用过"的元凶。
+struct PrescannedSig {
+    std::string sig;
+    std::vector<uintptr_t> hits;
+};
+
+static std::vector<PrescannedSig> g_prescanned;
+static std::atomic<bool> g_prescanDone{false};
+
+static void PrescanAll(const ModuleInfo& mod) {
+    std::vector<std::string> all = loadSignatures();
+    for (auto s : SIG_FALLBACK) {
+        const std::string sig(s);
+        if (std::find(all.begin(), all.end(), sig) == all.end()) all.push_back(sig);
+    }
+
+    std::vector<PrescannedSig> result;
+    result.reserve(all.size());
+    for (const auto& sig : all) {
+        PrescannedSig ps;
+        ps.sig = sig;
+        ResolveSignatureAll(mod, sig.c_str(), ps.hits, kMaxHitsPerSig);
+        result.push_back(std::move(ps));
+    }
+    g_prescanned = std::move(result);
+    g_prescanDone.store(true, std::memory_order_release);
+}
+
+// 取预扫描结果；sig 不匹配或没扫过时返回 false
+static bool LookupPrescan(const std::string& sig, std::vector<uintptr_t>& out) {
+    if (!g_prescanDone.load(std::memory_order_acquire)) return false;
+    for (const auto& ps : g_prescanned) {
+        if (ps.sig == sig) {
+            out = ps.hits;
+            return true;
+        }
     }
     return false;
 }
@@ -1124,17 +1294,23 @@ static bool tryInstallHook(const ModuleInfo& mod) {
                  cache.detour.c_str());
             g_loadedDetourType.clear();
         } else {
-            uintptr_t addr = scanOutOfTime() ? 0 : ResolveSignature(mod, cache.firstSig.c_str());
-            if (addr != 0) {
-                LOGI("[Trusted] Cached sig matched at 0x%lx (detour=%s).",
-                     addr, cache.detour.c_str());
+            std::vector<uintptr_t> cachedHits;
+            if (!scanOutOfTime() && !LookupPrescan(cache.firstSig, cachedHits)) {
+                ResolveSignatureAll(mod, cache.firstSig.c_str(), cachedHits, kMaxHitsPerSig);
+            }
+            if (cachedHits.empty()) {
+                LOGI("[Trusted] Cached sig no longer matches this build; full scan.");
+            } else {
+                LOGI("[Trusted] Cached sig matched %zu site(s) (detour=%s).",
+                     cachedHits.size(), cache.detour.c_str());
                 g_loadedDetourType = cache.detour;
-                if (installAt(addr, cache.firstSig, cache.detour, /*writeCache=*/false)) {
-                    return true;
+                for (size_t h = 0; h < cachedHits.size(); h++) {
+                    const uintptr_t addr = cachedHits[h];
+                    if (installAt(addr, cache.firstSig, cache.detour, /*writeCache=*/false)) {
+                        return true;
+                    }
                 }
                 LOGI("[Trusted] Cached sig did not hook cleanly; falling back to full scan.");
-            } else {
-                LOGI("[Trusted] Cached sig no longer matches this build; full scan.");
             }
         }
     }
@@ -1152,21 +1328,39 @@ static bool tryInstallHook(const ModuleInfo& mod) {
             LOGE("Scan time budget exhausted at sig[%zu/%zu].", i, all.size());
             return false;
         }
-        uintptr_t addr = ResolveSignature(mod, all[i].c_str());
-        if (addr == 0) continue;
+        // ★ 同一个特征码可能有多个匹配点（通配符越多越容易撞）。
+        //   逐个试，而不是命中第一个就放弃整条特征码。
+        std::vector<uintptr_t> hits;
+        if (!LookupPrescan(all[i], hits)) {
+            // 预扫描没跑成（引擎映射太晚等原因）才现扫
+            ResolveSignatureAll(mod, all[i].c_str(), hits, kMaxHitsPerSig);
+        }
+        if (hits.empty()) continue;
 
-        uint8_t* raw = (uint8_t*)addr;
-        LOGI("Sig[%zu] matched at 0x%lx", i, addr);
-        LOGI("  Bytes: %02X %02X %02X %02X %02X %02X %02X %02X"
-             " %02X %02X %02X %02X %02X %02X %02X %02X",
-             raw[0],  raw[1],  raw[2],  raw[3],
-             raw[4],  raw[5],  raw[6],  raw[7],
-             raw[8],  raw[9],  raw[10], raw[11],
-             raw[12], raw[13], raw[14], raw[15]);
+        LOGI("Sig[%zu] matched %zu site(s)", i, hits.size());
 
-        if (installAt(addr, all[i], /*preferredDetour=*/"", /*writeCache=*/true)) {
-            LOGI("Sig[%zu] installed and verified; signatures.json updated.", i);
-            return true;
+        for (size_t h = 0; h < hits.size(); h++) {
+            if (scanOutOfTime()) {
+                LOGE("Scan time budget exhausted at sig[%zu] hit[%zu/%zu].",
+                     i, h, hits.size());
+                return false;
+            }
+
+            const uintptr_t addr = hits[h];
+            uint8_t* raw = (uint8_t*)addr;
+            LOGI("  [%zu/%zu] at 0x%lx", h + 1, hits.size(), addr);
+            LOGI("    Bytes: %02X %02X %02X %02X %02X %02X %02X %02X"
+                 " %02X %02X %02X %02X %02X %02X %02X %02X",
+                 raw[0],  raw[1],  raw[2],  raw[3],
+                 raw[4],  raw[5],  raw[6],  raw[7],
+                 raw[8],  raw[9],  raw[10], raw[11],
+                 raw[12], raw[13], raw[14], raw[15]);
+
+            if (installAt(addr, all[i], /*preferredDetour=*/"", /*writeCache=*/true)) {
+                LOGI("Sig[%zu] installed and verified at hit[%zu]; signatures.json updated.",
+                     i, h);
+                return true;
+            }
         }
     }
 
@@ -1180,8 +1374,27 @@ static bool tryInstallHook(const ModuleInfo& mod) {
 static void* InjectionThread(void*) {
     LOGI("=== Background thread STARTED (tid=%d) ===", gettid());
 
-    // ★ 即使引擎已在内存中，也等待 MC 完成自身初始化（BootstrapConfig 等）
-    // sync hook 曾经在这里之前就装钩子，与 MC 初始化竞态导致偶数次启动崩溃
+    // ★ 这个等待不能去掉：sync hook 在这个点之前装钩子会与 MC 的
+    //   BootstrapConfig::initialize 抢时序，导致第偶数次启动 SIGABRT。
+    //   代价是"钩子晚 500ms 才装上"，但那是必须付的。
+    //
+    //   所以这里不缩短等待，而是把**扫描**挪到等待之前/并行去做：
+    //   扫描只是读内存、不碰 MC 的状态，早做完不产生副作用；
+    //   真正挂钩子仍然从 500ms 之后开始。
+    // 先等引擎映射出现，再做预扫描；两件事都可能在 500ms 之前完成
+    ModuleInfo preMod;
+    const int64_t preDeadline = monotonicMs() + 3000;
+    while (monotonicMs() < preDeadline) {
+        if (findMinecraftSegment(preMod)) break;
+        usleep(20 * 1000);
+    }
+    if (preMod.base != 0) {
+        const int64_t t0 = monotonicMs();
+        PrescanAll(preMod);
+        LOGI("Prescan finished in %lld ms (%zu signatures).",
+             (long long)(monotonicMs() - t0), g_prescanned.size());
+    }
+
     LOGI("Waiting 500ms for MC self-initialization...");
     usleep(500 * 1000);
 
@@ -1204,7 +1417,10 @@ static void* InjectionThread(void*) {
     // 旧实现是固定 50 轮、每轮把全部特征码 x 两种 detour 各等 10 秒，
     // 最坏要跑两个多小时才打印失败。现在改成：扫一遍，失败后只有在
     // "引擎 r-x 段布局变了"（MC 懒加载了新段）时才重扫，并且全程有截止时间。
-    const int64_t deadline = monotonicMs() + 180 * 1000; // 总共最多 3 分钟
+    // 总预算。原来 180s 但每条候选要等 20s、还要留时间给观察期，偏紧。
+    // 现在：扫描本身约 2~5s，几个候选各等一段，再留 30s 观察期 —— 5 分钟够用，
+    // 又不至于让"这个版本就是不支持"拖太久。
+    const int64_t deadline = monotonicMs() + 300 * 1000;
     g_scanDeadline = deadline;
 
     std::vector<std::pair<uintptr_t, size_t>> lastLayout;
@@ -1236,8 +1452,9 @@ static void* InjectionThread(void*) {
         usleep(500 * 1000);
     }
 
-    LOGE("Gave up after %d scan attempt(s). No signature matched this MC build; "
-         "a new signature is needed (edit signatures.json or update SIG_FALLBACK).",
+    LOGE("Gave up after %d scan attempt(s). No signature matched or the target "
+         "function was never called; a new signature may be needed "
+         "(edit signatures.json or update SIG_FALLBACK).",
          attempt);
     return nullptr;
 }

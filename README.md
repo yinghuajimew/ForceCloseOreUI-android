@@ -13,10 +13,6 @@ with a self-validating signature scanner that survives game updates.</p>
 
 <br/>
 
-> [!WARNING]
-> Unofficial mod. Not affiliated with Mojang or Microsoft. Modding Minecraft is against the
-> Minecraft Terms of Service and can get your account banned. Use at your own risk.
-
 > [!IMPORTANT]
 > **This is the standalone `.so`. You probably don't need it.**
 > The easiest way to use this project is the one-tap app:

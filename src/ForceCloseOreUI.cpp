@@ -25,6 +25,7 @@
 #include <sys/system_properties.h>
 #include <ctime>
 #include <cstring>
+#include "mc_version.h"
 
 namespace fs = std::filesystem;
 using Json = nlohmann::ordered_json;
@@ -33,6 +34,11 @@ static std::string packageName;
 static std::string getPackageName();
 static std::string getConfigDir();
 static std::string g_logFilePath;
+
+// ★ 游戏版本 + 变体标识，崩溃处理里也要用（必须是稳定的 char[]，
+//   信号处理器不能碰 std::string）
+static char g_mcVersion[64] = {0};
+static const char* kModVariant = "standalone (dobby, no preloader)";
 
 // ------------------------------------------------------------
 // 双通道日志（文件 + Logcat）
@@ -114,6 +120,8 @@ static void writeLogHeader() {
     fprintf(file,
         "\n======================================================\n"
         "[INFO] === SESSION START: %s ===\n"
+        "[INFO] Variant      : %s\n"
+        "[INFO] MC version   : %s\n"
         "[INFO] Manufacturer : %s\n"
         "[INFO] Model        : %s  (device: %s)\n"
         "[INFO] Android      : %s  (SDK %s)\n"
@@ -123,6 +131,8 @@ static void writeLogHeader() {
         "[INFO] PID          : %d\n"
         "======================================================\n",
         timebuf[0]      ? timebuf      : "unknown",
+        kModVariant,
+        g_mcVersion[0]  ? g_mcVersion  : "unknown",
         manufacturer[0] ? manufacturer : "unknown",
         model[0]        ? model        : "unknown",
         device_code[0]  ? device_code  : "?",
@@ -1567,6 +1577,11 @@ static struct sigaction g_oldSigSegv;
 static struct sigaction g_oldSigAbrt;
 static struct sigaction g_oldSigBus;
 
+// ★ 崩溃日志里必须能看出是哪个变体、哪个游戏版本。
+//   两个 so 的日志混在一起时，靠 Type 行区分，不然会把依赖版的
+//   preloader 崩溃误当成独立版的 hook 问题。
+//   （kModVariant 在文件顶部定义）
+
 static const char* sigToStr(int sig) {
     switch (sig) {
         case SIGSEGV: return "SIGSEGV (Segmentation Fault)";
@@ -1575,6 +1590,268 @@ static const char* sigToStr(int sig) {
         default:      return "Unknown Signal";
     }
 }
+
+// ------------------------------------------------------------
+// 崩溃现场回溯
+// ------------------------------------------------------------
+// 为什么不用 _Unwind_Backtrace：
+//   它从**信号处理器自己的栈帧**开始往上走，拿到的全是 handler 和
+//   信号 trampoline，真正的崩溃调用链在它下方，看不到。而且 libunwind
+//   内部会加锁，崩在加载器里时容易死锁。
+//
+// 这里改用 AArch64 帧指针链：x29 指向 [prev_fp, lr] 两字，顺着走就能
+// 还原调用链。关键是不能盲读 —— 帧指针可能是坏的，直接解引用会二次
+// 崩溃。所以先把 /proc/self/maps 读进静态缓冲区，每次读内存前确认
+// 目标地址确实落在一个可读映射里。
+static char g_mapsBuf[96 * 1024];
+
+struct MapRange { uintptr_t start, end; };
+static MapRange g_ranges[2048];
+static int g_rangeCount = 0;
+
+static void captureMaps() {
+    g_mapsBuf[0] = '\0';
+    g_rangeCount = 0;
+
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return;
+
+    size_t used = 0;
+    while (used < sizeof(g_mapsBuf) - 1) {
+        const ssize_t n = read(fd, g_mapsBuf + used, sizeof(g_mapsBuf) - 1 - used);
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    g_mapsBuf[used] = '\0';
+    close(fd);
+}
+
+static uintptr_t hexToU64(const char*& p) {
+    uintptr_t v = 0;
+    while (true) {
+        const char c = *p;
+        int d;
+        if (c >= '0' && c <= '9')      d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else break;
+        v = (v << 4) | (uintptr_t)d;
+        ++p;
+    }
+    return v;
+}
+
+// 收集所有可读段（第 2 列含 'r'）以及每个模块的最低基址
+static void buildRanges() {
+    g_rangeCount = 0;
+    const char* p = g_mapsBuf;
+
+    while (*p && g_rangeCount < (int)(sizeof(g_ranges) / sizeof(g_ranges[0]))) {
+        const char* lineEnd = p;
+        while (*lineEnd && *lineEnd != '\n') ++lineEnd;
+
+        const char* q = p;
+        const uintptr_t start = hexToU64(q);
+        if (*q == '-') {
+            ++q;
+            const uintptr_t end = hexToU64(q);
+            if (q + 1 < lineEnd && q[0] == ' ' && q[1] == 'r' && end > start) {
+                g_ranges[g_rangeCount].start = start;
+                g_ranges[g_rangeCount].end = end;
+                ++g_rangeCount;
+            }
+        }
+        p = (*lineEnd == '\n') ? lineEnd + 1 : lineEnd;
+    }
+}
+
+static bool isReadable(uintptr_t addr, size_t len) {
+    for (int i = 0; i < g_rangeCount; ++i) {
+        if (addr >= g_ranges[i].start && addr + len <= g_ranges[i].end)
+            return true;
+    }
+    return false;
+}
+
+// 把地址翻成 "模块名+偏移"。偏移相对模块加载基址（该模块所有映射里
+// 最低的 start），这样换一次启动、ASLR 变了也能直接比对。
+static bool resolveAddr(uintptr_t addr, char* out, size_t outSz) {
+    if (g_mapsBuf[0] == '\0') return false;
+
+    const char* p = g_mapsBuf;
+    while (*p) {
+        const char* lineEnd = p;
+        while (*lineEnd && *lineEnd != '\n') ++lineEnd;
+
+        const char* q = p;
+        const uintptr_t start = hexToU64(q);
+        if (*q == '-') {
+            ++q;
+            const uintptr_t end = hexToU64(q);
+
+            if (addr >= start && addr < end) {
+                // 跳过 perms / offset / dev / inode，找以 '/' 开头的路径
+                const char* r = q;
+                int fields = 0;
+                while (r < lineEnd && fields < 4) {
+                    while (r < lineEnd && *r == ' ') ++r;
+                    while (r < lineEnd && *r != ' ' && *r != '\n') ++r;
+                    ++fields;
+                }
+                while (r < lineEnd && *r == ' ') ++r;
+
+                if (r >= lineEnd || *r != '/') {
+                    snprintf(out, outSz, "[anon 0x%lX]",
+                             (unsigned long)(addr - start));
+                    return true;
+                }
+
+                const char* base = r;
+                for (const char* s = r; s < lineEnd; ++s)
+                    if (*s == '/') base = s + 1;
+                const size_t nameLen = (size_t)(lineEnd - base);
+
+                char want[56];
+                const size_t copyLen = nameLen > 48 ? 48 : nameLen;
+                memcpy(want, base, copyLen);
+                want[copyLen] = '\0';
+
+                // 找同名模块的最低 start 作为加载基址
+                uintptr_t moduleBase = start;
+                for (const char* s = g_mapsBuf; *s; ) {
+                    const char* le = s;
+                    while (*le && *le != '\n') ++le;
+
+                    const char* t = s;
+                    const uintptr_t st = hexToU64(t);
+                    if (*t == '-') {
+                        ++t;
+                        (void)hexToU64(t);
+                        const char* rr = t;
+                        int f2 = 0;
+                        while (rr < le && f2 < 4) {
+                            while (rr < le && *rr == ' ') ++rr;
+                            while (rr < le && *rr != ' ' && *rr != '\n') ++rr;
+                            ++f2;
+                        }
+                        while (rr < le && *rr == ' ') ++rr;
+                        if (rr < le && *rr == '/') {
+                            const char* b2 = rr;
+                            for (const char* x = rr; x < le; ++x)
+                                if (*x == '/') b2 = x + 1;
+                            if ((size_t)(le - b2) == copyLen &&
+                                memcmp(b2, want, copyLen) == 0 && st < moduleBase)
+                                moduleBase = st;
+                        }
+                    }
+                    s = (*le == '\n') ? le + 1 : le;
+                }
+
+                snprintf(out, outSz, "%s+0x%lX", want,
+                         (unsigned long)(addr - moduleBase));
+                return true;
+            }
+        }
+        p = (*lineEnd == '\n') ? lineEnd + 1 : lineEnd;
+    }
+    return false;
+}
+
+// AArch64 帧指针链：x29 -> [prev_fp, lr]
+static int captureFrames(uintptr_t fp, uintptr_t lr, uintptr_t* pcs, int maxPcs) {
+    int n = 0;
+    if (lr) pcs[n++] = lr;
+
+    int guard = 0;
+    while (fp && n < maxPcs && guard++ < 256) {
+        if (!isReadable(fp, 16)) break;
+
+        const uintptr_t prev = *(const uintptr_t*)fp;
+        const uintptr_t ret  = *(const uintptr_t*)(fp + 8);
+
+        if (ret) {
+            if (n == 0 || pcs[n - 1] != ret) pcs[n++] = ret;
+        }
+        if (prev <= fp) break;    // 链断了或者成环
+        fp = prev;
+    }
+    return n;
+}
+
+// ★ 栈扫描兜底。
+//   帧指针链只在"目标代码保留了 x29"时才完整。游戏本体和
+//   libpreloader.so 都是第三方编译的，很可能省掉了帧指针 —— 那样上面
+//   那条链只能拿到一两帧就断，恰好是我们最需要调用链的场合。
+//   这里再扫一遍栈：凡是落在某个可执行映射里的、且按 4 字节对齐的值，
+//   都有可能是返回地址。会有误报，所以放在帧链结果之后单独标注，
+//   并且只保留帧链没覆盖到的。
+struct ExecRange { uintptr_t start, end; };
+
+static int collectExecRanges(ExecRange* out, int maxOut) {
+    int n = 0;
+    const char* p = g_mapsBuf;
+    while (*p && n < maxOut) {
+        const char* lineEnd = p;
+        while (*lineEnd && *lineEnd != '\n') ++lineEnd;
+
+        const char* q = p;
+        const uintptr_t start = hexToU64(q);
+        if (*q == '-') {
+            ++q;
+            const uintptr_t end = hexToU64(q);
+            // perms 形如 "r-xp"：第二位可读、第三位可执行
+            if (q + 3 < lineEnd && q[1] == 'r' && q[2] == '-' && q[3] == 'x') {
+                out[n].start = start;
+                out[n].end = end;
+                ++n;
+            }
+        }
+        p = (*lineEnd == '\n') ? lineEnd + 1 : lineEnd;
+    }
+    return n;
+}
+
+static int scanStack(uintptr_t sp, uintptr_t* pcs, int maxPcs,
+                     const uintptr_t* known, int knownCount) {
+    if (!sp) return 0;
+
+    // ★ 用 static：这里跑在信号处理器里，栈空间可能已经被崩溃现场占满，
+    //   再往栈上放 8KB 数组有溢出风险。
+    static ExecRange execs[512];
+    const int nExec = collectExecRanges(execs, 512);
+    if (nExec == 0) return 0;
+
+    // 从栈顶往上扫一段。64KB 足够覆盖常规调用深度，再多只是拖慢崩溃
+    // 处理、增加误报。
+    const size_t words = 8192;
+    int n = 0;
+
+    for (size_t i = 0; i < words && n < maxPcs; ++i) {
+        const uintptr_t slot = sp + i * 8;
+        if (!isReadable(slot, 8)) break;
+
+        const uintptr_t v = *(const uintptr_t*)slot;
+        if (v < 0x1000) continue;
+
+        bool exec = false;
+        for (int k = 0; k < nExec; ++k) {
+            if (v >= execs[k].start && v < execs[k].end) { exec = true; break; }
+        }
+        if (!exec) continue;
+
+        bool dup = false;
+        for (int k = 0; k < knownCount; ++k)
+            if (known[k] == v) { dup = true; break; }
+        for (int k = 0; k < n; ++k)
+            if (pcs[k] == v) { dup = true; break; }
+        if (dup) continue;
+
+        pcs[n++] = v;
+    }
+    return n;
+}
+
+
 
 static void crashSignalHandler(int sig, siginfo_t* info, void* ucontext) {
     // ★ 全程只用 async-signal-safe 函数：open / write / snprintf / close
@@ -1592,12 +1869,16 @@ static void crashSignalHandler(int sig, siginfo_t* info, void* ucontext) {
             len = snprintf(buf, sizeof(buf),
                 "\n========================================\n"
                 "[NATIVE CRASH] %s\n"
+                "Type          : %s\n"
+                "MC version    : %s\n"
                 "Fault address : %p\n"
                 "Signal code   : %d\n"
                 "PID           : %d\n"
                 "PC            : 0x%lx\n"
                 "========================================\n",
                 sigToStr(sig),
+                kModVariant,
+                g_mcVersion[0] ? g_mcVersion : "unknown",
                 info->si_addr,
                 info->si_code,
                 getpid(),
@@ -1617,6 +1898,55 @@ static void crashSignalHandler(int sig, siginfo_t* info, void* ucontext) {
                            (unsigned long)uc->uc_mcontext.sp,
                            (unsigned long)uc->uc_mcontext.regs[30]);
             write(fd, buf, len);
+
+            // ★ 回溯栈。寄存器只能告诉我们"崩在哪条指令"，
+            //   看不出"是谁调过来的" —— 定位依赖版 preloader 崩溃时
+            //   最缺的就是这条调用链。
+            captureMaps();
+            buildRanges();
+
+            uintptr_t pcs[48];
+            const int nFrames = captureFrames((uintptr_t)uc->uc_mcontext.regs[29],
+                                              (uintptr_t)uc->uc_mcontext.regs[30],
+                                              pcs, 40);
+
+            static const char kBtHead[] = "\n--- backtrace (module+offset) ---\n";
+            write(fd, kBtHead, sizeof(kBtHead) - 1);
+
+            for (int i = 0; i < nFrames; ++i) {
+                char where[128];
+                if (!resolveAddr(pcs[i], where, sizeof(where)))
+                    snprintf(where, sizeof(where), "0x%lX", (unsigned long)pcs[i]);
+
+                len = snprintf(buf, sizeof(buf), "#%-2d %s\n", i, where);
+                write(fd, buf, len);
+            }
+
+            // 帧链断了（第三方 so 没保留 x29）时用栈扫描补一段。
+            // 这部分是"可能"的返回地址，会有误报，所以单独标明。
+            if (nFrames < 6) {
+                uintptr_t extra[16];
+                const int nExtra = scanStack((uintptr_t)uc->uc_mcontext.sp,
+                                             extra, 16, pcs, nFrames);
+                if (nExtra > 0) {
+                    static const char kScanHead[] =
+                        "--- stack scan (heuristic, frame pointer chain broke early) ---\n";
+                    write(fd, kScanHead, sizeof(kScanHead) - 1);
+
+                    for (int i = 0; i < nExtra; ++i) {
+                        char where[128];
+                        if (!resolveAddr(extra[i], where, sizeof(where)))
+                            snprintf(where, sizeof(where), "0x%lX",
+                                     (unsigned long)extra[i]);
+
+                        len = snprintf(buf, sizeof(buf), " ?%-2d %s\n", i, where);
+                        write(fd, buf, len);
+                    }
+                }
+            }
+
+            static const char kBtTail[] = "--- end backtrace ---\n";
+            write(fd, kBtTail, sizeof(kBtTail) - 1);
 
             close(fd);
         }
@@ -1656,7 +1986,18 @@ __attribute__((constructor))
 static void ForceCloseOreUI_Init() {
     packageName = getPackageName();
 
+    // ★ 版本号必须在任何日志/崩溃处理之前取到：
+    //   崩溃处理器里要写它，writeLogHeader 也要写它。
+    //   解一次 APK 只读 ~70KB，几十毫秒，放这里是安全的。
+    {
+        const std::string v = mcver::getVersionName();
+        if (!v.empty())
+            snprintf(g_mcVersion, sizeof(g_mcVersion), "%s", v.c_str());
+    }
+
     LOGI("=== ForceCloseOreUI Mod Started ===");
+    LOGI("Variant: %s", kModVariant);
+    LOGI("MC version: %s", g_mcVersion[0] ? g_mcVersion : "unknown");
     LOGI("Package: %s", packageName.c_str());
     
     ensureConfigExists();

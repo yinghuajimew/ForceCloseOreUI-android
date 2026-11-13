@@ -197,6 +197,8 @@ public:
 // 而不是 1.26 那种具体界面路由(/oreui-marketplace/search, /send-invites)。
 // 即 1.20 已有 OreUI 运行时、界面仍是 JSON-UI，钩子目标与 1.26 不同，
 // 不能简单复用。
+//
+// ★ 每条特征码的引入提交、是否实测、命中地址见 tools/SIGNATURE_PROVENANCE.md
 // ============================================================================
 
 static const std::vector<const char*> SIG_FALLBACK = {

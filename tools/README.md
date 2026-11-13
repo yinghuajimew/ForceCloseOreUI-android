@@ -7,6 +7,8 @@
 > 数分钟到数小时；而找特征码只需要读 ELF 头、定位字符串、扫 `.text`，几十秒即可完成，
 > GitHub Actions 标准 runner 完全够用。
 
+> **想先了解现有特征码哪些靠得住？** 见 [`SIGNATURE_PROVENANCE.md`](./SIGNATURE_PROVENANCE.md) —— 逐条记录来源、引入提交、实测结论，以及已丢弃的条目和理由。
+
 ---
 
 ## 一、特征码长什么样

@@ -34,6 +34,7 @@ ANCHOR_STRINGS = [
 ]
 
 MAX_PROLOGUE_INSNS = 16
+MAX_HITS = 6  # 每个模式最多回报 6 个命中点（与 mod 的 ResolveSignatureAll 一致）
 
 
 # --------------------------------------------------------------------------
@@ -328,6 +329,64 @@ def build_pattern(prologue):
     return " ".join(toks)
 
 
+def anchor_of(pat: list[int]) -> tuple[int, bytes]:
+    """最长连续固定字节段 —— 用来把逐字节比对降成 C 层 find。"""
+    best_off = best_len = 0
+    i, n = 0, len(pat)
+    while i < n:
+        if pat[i] < 0:
+            i += 1
+            continue
+        j = i
+        while j < n and pat[j] >= 0:
+            j += 1
+        if j - i > best_len:
+            best_off, best_len = i, j - i
+        i = j
+    return best_off, bytes(pat[best_off:best_off + best_len])
+
+
+def parse_pattern(sig: str) -> list[int]:
+    """'? ? 3F D1' -> [-1, -1, 0x3F, 0xD1]"""
+    return [-1 if t == "?" else int(t, 16) for t in sig.split()]
+
+
+def self_verify(blob: bytes, text_va: int, pat_str: str) -> list[int]:
+    """把刚生成的特征码在 .text 上重新扫一遍，返回命中的 VA 列表。
+
+    「命中」不等于「可用」：必须确认命中处之前是 ret/br/b，才说明它落在
+    函数入口。在函数中间下钩子会覆盖被调用指令或破坏栈帧。
+    """
+    pat = parse_pattern(pat_str)
+    aoff, anc = anchor_of(pat)
+    plen = len(pat)
+    hits = []
+    start = 0
+    end = len(blob) - plen
+    while len(hits) < MAX_HITS:
+        j = blob.find(anc, start, end + aoff + len(anc))
+        if j < 0:
+            break
+        pos = j - aoff
+        if pos >= 0 and pos <= end and all(
+            b < 0 or blob[pos + k] == b for k, b in enumerate(pat)
+        ):
+            hits.append(text_va + pos)
+        start = j + 1
+    return hits
+
+
+def is_func_entry(blob: bytes, text_va: int, va: int) -> bool:
+    """命中处是否落在函数入口（前一条是 ret/br/b，或就在 .text 开头）。"""
+    off = va - text_va
+    if off <= 0:
+        return True
+    if off % 4:
+        return False
+    prev = struct.unpack_from("<I", blob, off - 4)[0]
+    return is_terminator(prev)
+
+
 def main(argv):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -387,6 +446,21 @@ def main(argv):
     for va, w, cls in pro:
         print(f"  0x{va:X}  {w:08X}  {cls}")
     print(f"\n生成特征码：\n{pat}\n")
+
+    # ---- 自验：把刚生成的特征码回扫，确认唯一命中且落在函数入口 ----
+    hits = self_verify(blob, text["addr"], pat)
+    entry_ok = [h for h in hits if is_func_entry(blob, text["addr"], h)]
+    print(f"自验：命中 {len(hits)} 处 -> {[hex(h) for h in hits] or '无'}")
+    print(f"      位于函数入口：{len(entry_ok)} 处 {[hex(h) for h in entry_ok]}")
+    if len(hits) == 1 and len(entry_ok) == 1:
+        print("      ✅ 唯一命中且位于函数入口，可直接使用")
+    elif len(entry_ok) >= 1:
+        print("      ⚠️ 有多个命中，其中包含函数入口，可用")
+    elif hits:
+        print("      ❌ 命中处均不在函数入口，请人工复核")
+    else:
+        print("      ❌ 连自己都扫不到，模式生成有误")
+    print()
 
     if "--json" in argv:
         out = argv[argv.index("--json") + 1]

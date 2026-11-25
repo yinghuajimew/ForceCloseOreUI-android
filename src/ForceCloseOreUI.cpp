@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdint>
 #include <unistd.h>
 #include <cstdarg>
 #include <android/log.h>
@@ -267,7 +268,13 @@ static std::vector<std::string>& loadSignatures() {
 //   才清 false；只要某次 detour 在清除之后跑完，这个 true 就会被下一次尝试
 //   当作"验证通过"，连后面的 V10 尝试也会立刻误判。
 //   现在每次尝试换一代，detour 只认自己那一代，跨代写入一律丢弃。
-enum class HookVerdict { Pending = 0, Valid = 1, Empty = 2, Invalid = 3 };
+enum class HookVerdict {
+    Pending = 0, // 还没被调用过，真假未知
+    Valid   = 1, // 被调用且 mConfigs 合理 —— 钩子确定对了
+    Empty   = 2, // 被调用但 mConfigs 还空 —— 钩子位置对了，等下次调用
+    Invalid = 3, // mConfigs 畸形（>2000）—— 钩错了，必须拆
+    Held    = 4, // 没等到调用，但命中处是函数入口 —— 保留，不拆
+};
 
 // 暂停用于"本次尝试总预算"：特征码扫描每条都要等 10 秒验证，
 // 不加预算的话全量扫描会超出外层的整体限时。
@@ -283,23 +290,23 @@ static inline bool scanOutOfTime() {
     return g_scanDeadline != 0 && monotonicMs() >= g_scanDeadline;
 }
 
-// 低 2 位是结论，高位是代号
+// 低 3 位是结论，高位是代号（结论有 5 个取值，2 位放不下）
 static std::atomic<unsigned> g_hookState{0};
 
 static inline unsigned hookStatePack(unsigned gen, HookVerdict v) {
-    return (gen << 2) | static_cast<unsigned>(v);
+    return (gen << 3) | static_cast<unsigned>(v);
 }
 
 // 开一次新尝试，返回这一代的编号
 static inline unsigned beginHookAttempt() {
-    const unsigned gen = (g_hookState.load(std::memory_order_acquire) >> 2) + 1;
+    const unsigned gen = (g_hookState.load(std::memory_order_acquire) >> 3) + 1;
     g_hookState.store(hookStatePack(gen, HookVerdict::Pending),
                       std::memory_order_release);
     return gen;
 }
 
 static inline unsigned currentHookGen() {
-    return g_hookState.load(std::memory_order_acquire) >> 2;
+    return g_hookState.load(std::memory_order_acquire) >> 3;
 }
 
 // 结论的"严格程度"：一旦 Valid 就不再被降级。
@@ -307,9 +314,12 @@ static inline unsigned currentHookGen() {
 // Empty 升级为 Valid，同时避免后续调用把已确认的结果覆盖掉。
 static inline int hookVerdictRank(HookVerdict v) {
     switch (v) {
-        case HookVerdict::Valid:   return 3;
-        case HookVerdict::Empty:   return 2;
-        case HookVerdict::Invalid: return 1;
+        case HookVerdict::Valid:   return 4;
+        case HookVerdict::Empty:   return 3;
+        case HookVerdict::Invalid: return 2;
+        // ★ Held 排在 Invalid 之下：先按"函数入口"保留，但如果真的被调用后
+        //   mConfigs 畸形，仍要允许升级成 Invalid 把它拆掉。
+        case HookVerdict::Held:    return 1;
         default:                   return 0;
     }
 }
@@ -318,8 +328,8 @@ static inline int hookVerdictRank(HookVerdict v) {
 static inline void markHookVerdict(unsigned gen, HookVerdict v) {
     unsigned cur = g_hookState.load(std::memory_order_acquire);
     for (;;) {
-        if ((cur >> 2) != gen) return;
-        const HookVerdict after = static_cast<HookVerdict>(cur & 3u);
+        if ((cur >> 3) != gen) return;
+        const HookVerdict after = static_cast<HookVerdict>(cur & 7u);
         if (hookVerdictRank(v) <= hookVerdictRank(after)) return;
         if (g_hookState.compare_exchange_weak(cur, hookStatePack(gen, v),
                                               std::memory_order_acq_rel,
@@ -330,7 +340,7 @@ static inline void markHookVerdict(unsigned gen, HookVerdict v) {
 }
 
 static inline HookVerdict hookAttemptVerdict() {
-    return static_cast<HookVerdict>(g_hookState.load(std::memory_order_acquire) & 3u);
+    return static_cast<HookVerdict>(g_hookState.load(std::memory_order_acquire) & 7u);
 }
 
 
@@ -436,6 +446,66 @@ static uintptr_t ResolveSignature(const ModuleInfo& mod, const char* sig) {
         }
     }
     return 0;
+}
+
+// ------------------------------------------------------------
+// 函数入口判定
+// ------------------------------------------------------------
+// ★ 为什么需要它：特征码命中不等于命中了函数入口。H4/H5/H7/H8 在
+//   1.21.132.1 / 1.26.0.2 上实测就落在函数中间（前一条是 bl）。
+//   在函数中间装钩子，detour 返回后会从半截继续执行，栈/寄存器状态
+//   都是错的 —— 这是崩溃的一个来源，绝不能"为了等函数调用"而保留。
+//
+//   规则与 tools/derive_sig.py 的 is_terminator() 保持一致：
+//   前一条指令是 ret / br / b，或命中处就在段首，才算函数入口。
+static inline bool isArm64Terminator(uint32_t w) {
+    if (w == 0xD65F03C0u) return true;              // ret
+    if ((w & 0xFFFFFC1Fu) == 0xD65F0000u) return true; // ret xN / br xN / blr xN
+    if ((w & 0xFC000000u) == 0x14000000u) return true; // b .+imm
+    return false;
+}
+
+static bool isFunctionEntry(const ModuleInfo& mod, uintptr_t addr) {
+    for (auto& [segBase, segSize] : mod.segments) {
+        if (addr < segBase || addr >= segBase + segSize) continue;
+        // 段首：没有前一条指令可比，按入口处理
+        if (addr == segBase) return true;
+        if ((addr - segBase) % 4 != 0) return false;
+        uint32_t prev = 0;
+        memcpy(&prev, (const void*)(addr - 4), sizeof(prev));
+        return isArm64Terminator(prev);
+    }
+    return false; // 不在任何 r-x 段内，无法判断
+}
+
+// ------------------------------------------------------------
+// 地址可读性探测
+// ------------------------------------------------------------
+// ★ 用途：Held 保留钩子后，函数可能在很久之后才被调用。若 detour 的
+//   calling convention 猜错了（V1 在 x0 / V10 在 x9），那颗指针就是野指针，
+//   直接读 mConfigs 会 SIGSEGV。这里在真正解引用之前先查 /proc/self/maps。
+//   读不出 maps 时返回 true —— 宁可照旧执行，也不要无端拒绝正常路径。
+static bool isAddrReadable(const void* p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    if (a < 4096) return false;
+
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return true; // 无法判断，放行
+
+    char line[1024];
+    bool ok = false;
+    while (fgets(line, sizeof(line), fp)) {
+        uintptr_t start = 0, end = 0;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
+        if (a >= start && a < end) {
+            // 权限字段形如 "rw-p"：第 1 个字符必须是 r
+            const char* sp = strchr(line, ' ');
+            ok = (sp != nullptr && sp[1] == 'r');
+            break;
+        }
+    }
+    fclose(fp);
+    return ok;
 }
 
 // ------------------------------------------------------------
@@ -797,6 +867,20 @@ static void writeMatchedSignature(const std::string& sig, const std::string& det
 //   map 有可能还没填充。原来的实现直接 return 不置 g_hookValid，导致正确
 //   的钩子被 DobbyDestroy 拆掉，然后 50 轮全白跑。
 static bool applyConfig(OreUi& ore_ui, const char* label, unsigned gen) {
+    // ★ 只在"还没被确认命中"时才做指针可读性检查。
+    //   正常情况下 detour 的 calling convention 由特征码实测确定，不会走错；
+    //   但 Held 会保留一条"尚未被调用过"的钩子，如果真实函数用的是另一种
+    //   约定（V1 在 x0 / V10 在 x9），晚调用时这里就是个野指针。
+    //   直接解引用会是 SIGSEGV，所以先探一下再读 mConfigs。
+    //   一旦结论升到 Valid 就说明这个指针本来就能读，无需再查（也避免每次
+    //   调用都去开一遍 /proc/self/maps）。
+    if (hookAttemptVerdict() != HookVerdict::Valid && !isAddrReadable(&ore_ui)) {
+        LOGE("[%s] bad OreUi reference (%p); wrong detour convention?",
+             label, (void*)&ore_ui);
+        markHookVerdict(gen, HookVerdict::Invalid);
+        return false;
+    }
+
     size_t map_size = ore_ui.mConfigs.size();
     if (map_size == 0) {
         LOGI("[%s] mConfigs empty (size 0) - not filled yet.", label);
@@ -1002,8 +1086,10 @@ static void detour_v10(void* a1, void* a2, void* a3, void* a4, void* a5,
 //     Valid   —— 函数被调用且 mConfigs 大小合理，句柄保留
 //     Empty   —— 函数被调用但 mConfigs 为空（还没填充）。没有东西可改，
 //                但销毁钩子会漏掉真正的目标函数，所以保留并告警
-//     Invalid —— 函数没被调用，或 size 明显畸形（>2000）→ 拆掉换下一条
-static HookVerdict tryHookOnce(uintptr_t addr, bool v1) {
+//     Held    —— 没等到调用，但命中处确实是函数入口 → 保留，等它自然发生
+//     Invalid —— size 明显畸形（>2000），或没等到调用且命中处不是函数入口
+//                （在函数中间挂钩，detour 返回后状态是错的，必须拆）
+static HookVerdict tryHookOnce(const ModuleInfo& mod, uintptr_t addr, bool v1) {
     const unsigned gen = beginHookAttempt();
 
     void* detour = v1 ? (void*)detour_v1 : (void*)detour_v10;
@@ -1033,6 +1119,32 @@ static HookVerdict tryHookOnce(uintptr_t addr, bool v1) {
         return HookVerdict::Empty;
     }
 
+    if (verdict == HookVerdict::Invalid) {
+        // 被调用过，但 mConfigs 畸形 —— 钩错了函数
+        DobbyDestroy((void*)addr);
+        *origSlot = nullptr;
+        return HookVerdict::Invalid;
+    }
+
+    // ★ 走到这里说明：装上了钩子，但等待窗口内游戏没调用它。
+    //
+    //   老实现一律拆掉、判定 INVALID，这对"启动后期才调用"的函数是致命的：
+    //   特征码本身命中在函数入口，钩子完全正确，只是这次启动没有走到那条
+    //   路径（比如要等玩家打开某个界面）。拆掉之后就再也没机会生效了。
+    //
+    //   但如果命中处不是函数入口（H4/H5/H7/H8 有这种情形），保留钩子会让
+    //   detour 从函数中间返回、寄存器状态不对 —— 那是崩溃来源，必须拆。
+    //
+    //   所以这里按"是否为函数入口"分流：入口则保留等待，非入口才拆。
+    if (isFunctionEntry(mod, addr)) {
+        markHookVerdict(gen, HookVerdict::Held);
+        LOGE("  → %s hook installed at a function entry but never called yet;"
+             " keeping it and waiting.", v1 ? "V1" : "V10");
+        return HookVerdict::Held;
+    }
+
+    LOGE("  → %s hook never called and hit is NOT a function entry;"
+         " removing to avoid mid-function execution.", v1 ? "V1" : "V10");
     DobbyDestroy((void*)addr);
     *origSlot = nullptr;
     return HookVerdict::Invalid;
@@ -1086,7 +1198,7 @@ static SigCache readSigCache() {
 
 // 在 addr 处装钩子并验证。preferredDetour 非空时先试它，再补另一代。
 // 返回 true 表示钩子已在位（Valid 或 Empty 都算在位）。
-static bool installAt(uintptr_t addr, const std::string& sigText,
+static bool installAt(const ModuleInfo& mod, uintptr_t addr, const std::string& sigText,
                       const std::string& preferredDetour, bool writeCache) {
     prepareHookAddr(addr);
 
@@ -1097,7 +1209,7 @@ static bool installAt(uintptr_t addr, const std::string& sigText,
 
     for (const auto& name : order) {
         const bool v1 = (name == "V1");
-        const HookVerdict verdict = tryHookOnce(addr, v1);
+        const HookVerdict verdict = tryHookOnce(mod, addr, v1);
 
         if (verdict == HookVerdict::Valid) {
             if (writeCache) {
@@ -1123,7 +1235,21 @@ static bool installAt(uintptr_t addr, const std::string& sigText,
             return true;
         }
 
-        LOGE("  → %s hook INVALID (not called or bad sanity). Trying next.", name.c_str());
+        if (verdict == HookVerdict::Held) {
+            // ★ 命中处是函数入口，只是这次启动还没调用到它。
+            //   保留钩子等它自然发生 —— 拆掉就等于这局彻底失效。
+            //   同时写入缓存：位置已经确定，下次启动直接走 trusted 少扫一遍。
+            if (writeCache) {
+                writeMatchedSignature(sigText, name, /*forceOverwrite=*/true);
+            }
+            LOGI("  → %s hook HELD at function entry; will apply when the game"
+                 " calls it (%s).", name.c_str(),
+                 writeCache ? "signatures.json updated" : "trusted, cache kept");
+            return true;
+        }
+
+        LOGE("  → %s hook INVALID (mid-function hit or bad sanity). Trying next.",
+             name.c_str());
     }
     return false;
 }
@@ -1160,7 +1286,7 @@ static bool tryInstallHook(const ModuleInfo& mod) {
                 LOGI("[Trusted] Cached sig matched at 0x%lx (detour=%s).",
                      addr, cache.detour.c_str());
                 g_loadedDetourType = cache.detour;
-                if (installAt(addr, cache.firstSig, cache.detour, /*writeCache=*/false)) {
+                if (installAt(mod, addr, cache.firstSig, cache.detour, /*writeCache=*/false)) {
                     return true;
                 }
                 LOGI("[Trusted] Cached sig did not hook cleanly; falling back to full scan.");
@@ -1195,7 +1321,7 @@ static bool tryInstallHook(const ModuleInfo& mod) {
              raw[8],  raw[9],  raw[10], raw[11],
              raw[12], raw[13], raw[14], raw[15]);
 
-        if (installAt(addr, all[i], /*preferredDetour=*/"", /*writeCache=*/true)) {
+        if (installAt(mod, addr, all[i], /*preferredDetour=*/"", /*writeCache=*/true)) {
             LOGI("Sig[%zu] installed and verified; signatures.json updated.", i);
             return true;
         }
